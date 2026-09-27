@@ -105,11 +105,11 @@ SEGMENT_DATA_BYTES = 12              # upper transport bytes per segment (segmen
 SAR_SEGMENT_INTERVAL_MS = 60.0       # SAR Segment Interval Step: (step + 1) x 10 ms
 SAR_UNICAST_RETRANSMISSIONS_COUNT = 2                   # retransmissions (3 attempts in total)
 SAR_UNICAST_RETRANSMISSIONS_WITHOUT_PROGRESS_COUNT = 2  # retransmissions without a progressing ack
-SAR_UNICAST_RETRANS_INTERVAL_STEP_MS = 150.0       # (step + 1) x 25 ms
+SAR_UNICAST_RETRANS_INTERVAL_STEP_MS = 200.0       # (step + 1) x 25 ms; default field 0x07
 SAR_UNICAST_RETRANS_INTERVAL_INCREMENT_MS = 50.0   # (increment + 1) x 25 ms
 # SAR Receiver
 SAR_SEGMENTS_THRESHOLD = 3           # acks are retransmitted only for messages with SegN above this
-SAR_ACK_DELAY_INCREMENT = 2.5        # SAR Acknowledgment Delay Increment: value + 1.5 (segment intervals)
+SAR_ACK_DELAY_INCREMENT = 2.5        # SAR Acknowledgment Delay Increment: field + 1.5 (segment intervals)
 SAR_RECEIVER_SEGMENT_INTERVAL_MS = 60.0  # SAR Receiver Segment Interval Step: (step + 1) x 10 ms
 SAR_ACK_RETRANSMISSIONS_COUNT = 0    # extra copies of each acknowledgment (if SegN > threshold)
 SAR_DISCARD_TIMEOUT_S = 10.0         # SAR Discard Timeout: (value + 1) x 5 s
@@ -229,8 +229,8 @@ def unicast_retrans_interval_ms(ttl: int) -> float:
 
 
 def ack_timer_ms(seg_n: int) -> float:
-    """Mesh 1.1 SAR acknowledgment timer: min(SegN + 1, delay increment) x receiver segment interval."""
-    return min(seg_n + 1, SAR_ACK_DELAY_INCREMENT) * SAR_RECEIVER_SEGMENT_INTERVAL_MS
+    """Mesh 1.1 SAR acknowledgment timer: min(SegN + 0.5, delay increment) x receiver segment interval."""
+    return min(seg_n + 0.5, SAR_ACK_DELAY_INCREMENT) * SAR_RECEIVER_SEGMENT_INTERVAL_MS
 
 
 print(f"Nominal round duration      : {N_SEGMENTS} segments x {SAR_SEGMENT_INTERVAL_MS:g} ms = {N_SEGMENTS * SAR_SEGMENT_INTERVAL_MS:g} ms")
@@ -240,8 +240,8 @@ for name, value in SAR_FIELDS.items():
 print(f"  segment interval {SAR_SEGMENT_INTERVAL_MS:g} ms; up to {SAR_UNICAST_RETRANSMISSIONS_COUNT} retransmissions "
       f"({SAR_UNICAST_RETRANSMISSIONS_COUNT + 1} attempts), at most {SAR_UNICAST_RETRANSMISSIONS_WITHOUT_PROGRESS_COUNT} "
       f"without progress; discard timeout {SAR_DISCARD_TIMEOUT_S:g} s")
-print(f"  acknowledgment timer for a {N_SEGMENTS}-segment message: min({N_SEGMENTS}, {SAR_ACK_DELAY_INCREMENT:g}) x "
-      f"{SAR_RECEIVER_SEGMENT_INTERVAL_MS:g} ms = {ack_timer_ms(N_SEGMENTS - 1):g} ms; acknowledgment copies: "
+print(f"  acknowledgment timer for a {N_SEGMENTS}-segment message: min({N_SEGMENTS - 1} + 0.5, {SAR_ACK_DELAY_INCREMENT:g}) x "
+      f"{SAR_RECEIVER_SEGMENT_INTERVAL_MS:g} ms = {ack_timer_ms(N_SEGMENTS - 1):g} ms; transmissions per timer acknowledgment: "
       f"{1 + (SAR_ACK_RETRANSMISSIONS_COUNT if N_SEGMENTS - 1 > SAR_SEGMENTS_THRESHOLD else 0)}")
 for ttl in (1, 2, 3):
     print(f"  TTL {ttl}: unicast retransmissions timer {unicast_retrans_interval_ms(ttl):g} ms")
@@ -324,60 +324,78 @@ print(f"Intervals (min)             : {INTERVALS}, offset mode '{OFFSET_MODE}', 
 # * Upper transport PDU = payload + opcode (1 byte) + TransMIC (4 bytes) = 205 bytes, carried as
 #   a segmented access message of 12 bytes per segment: **18 segments**. Each segment is its own
 #   network PDU with its own sequence number; it is relayed and cached independently.
-# The SAR behaviour follows **Mesh Protocol 1.1** (§3.5.3, SAR Transmitter and SAR Receiver states,
-# §4.2.x). The configuration cell gives each state in physical units and checks that it can be
-# encoded in its state field.
 #
-# * **Sender (meter).** Segments are sent in order, one every `SAR_SEGMENT_INTERVAL_MS` (SAR
-#   Segment Interval Step): segment $k+1$ is handed to the radio queue one interval after segment $k$
-#   (the queue can delay it further). After the last segment of a round has been transmitted, the
-#   **SAR unicast retransmissions timer** starts with
-#   step + increment · (TTL − 1) (step alone if TTL = 0), where TTL is the TTL of the message.
-#   * Two counters start at `SAR_UNICAST_RETRANSMISSIONS_COUNT` and
-#     `SAR_UNICAST_RETRANSMISSIONS_WITHOUT_PROGRESS_COUNT`. Every retransmission round decrements
-#     both. An acknowledgment that acknowledges at least one new segment (progress) resets the
-#     without-progress counter. When a retransmission round is due and either counter is 0, the
-#     sender cancels the message (failure). With the defaults 2 / 2, each segment is sent at most
-#     3 times, and at most 3 attempts are made without progress.
-#   * On an acknowledgment, acknowledged segments are marked. If all are acknowledged the message
-#     is done. If the sender is waiting for the timer (round finished), the timer is cancelled and a
-#     new round retransmits only the unacknowledged segments at once. If the acknowledgment arrives
-#     while a round is still being sent (an intermediate acknowledgment from the DCU's timer), the
-#     round continues and skips segments that are now acknowledged; no extra round is started.
-#   * If the timer expires, a new round retransmits all unacknowledged segments.
-#   * Retransmitted segments keep SeqZero but get new sequence numbers, so caches do not drop them.
-#   * A meter has at most one segmented message in progress (the specification forbids two
-#     concurrent segmented messages to the same destination). A reading generated while the
-#     previous one is still in progress waits in a FIFO queue.
+# The SAR behaviour follows **Mesh Protocol 1.1** (§3.5.3.3 and §3.5.3.4; SAR Transmitter and SAR
+# Receiver states). Where the text leaves details open, the model follows the Zephyr RTOS Bluetooth
+# Mesh stack (`subsys/bluetooth/mesh/transport.c`), whose comments cite these sections. The
+# configuration cell gives each state in physical units and checks that it can be encoded in its
+# state field; the defaults are the specification's default field values (printed above).
+#
+# | State | Field | Value |
+# |---|---|---|
+# | SAR Segment Interval Step | 0x05 | (5 + 1) × 10 = 60 ms between segments |
+# | SAR Unicast Retransmissions Count | 0x02 | 2 retransmissions (3 attempts) |
+# | SAR Unicast Retransmissions Without Progress Count | 0x02 | 2 retransmissions (3 attempts) without progress |
+# | SAR Unicast Retransmissions Interval Step | 0x07 | (7 + 1) × 25 = 200 ms |
+# | SAR Unicast Retransmissions Interval Increment | 0x01 | (1 + 1) × 25 = 50 ms |
+# | SAR Segments Threshold | 0x03 | acknowledgments are repeated only if SegN > 3 |
+# | SAR Acknowledgment Delay Increment | 0x01 | 1 + 1.5 = 2.5 segment intervals |
+# | SAR Receiver Segment Interval Step | 0x05 | (5 + 1) × 10 = 60 ms |
+# | SAR Acknowledgment Retransmissions Count | 0x00 | no repeated acknowledgments |
+# | SAR Discard Timeout | 0x01 | (1 + 1) × 5 = 10 s |
+#
+# * **Sender (meter).** Segments are sent in order. Segment $k+1$ starts one segment interval after
+#   the start of segment $k$'s advertising event, and not before segment $k$ has been transmitted
+#   (the radio queue can delay it further). One pass over the unacknowledged segments is a
+#   **round**; the first round sends all 18.
+#   * When a round ends (one segment interval after the start of its last segment), the **SAR
+#     unicast retransmissions timer** runs until
+#     *start of last segment* + step + increment · (TTL − 1) (step alone if TTL = 0), with the
+#     TTL of the message: 200 ms for TTL 1, 250 ms for TTL 2.
+#   * Two counters limit the attempts: the total count and the without-progress count, each allowing
+#     count + 1 rounds including the first one. The end of every round uses one total attempt and,
+#     unless an acknowledgment arrived after the round's last segment, one without-progress attempt.
+#     An acknowledgment that acknowledges at least one new segment (**progress**) resets the
+#     without-progress counter. When a new round is due and either counter is used up, the sender
+#     cancels the message. With the defaults 2 / 2, each segment is sent at most 3 times.
+#   * An acknowledgment that acknowledges every segment ends the message (success).
+#   * An acknowledgment received while the timer runs (with or without progress) stops the timer
+#     and starts the next round at once (but not earlier than one segment interval after the last
+#     segment). An acknowledgment received during a round marks the acknowledged segments, which the
+#     round then skips; if it arrived after the round's last segment, the next round starts one
+#     segment interval later instead of waiting for the timer.
+#   * A round retransmits only the unacknowledged segments. They keep SeqZero but get new sequence
+#     numbers, so network caches do not drop them.
+#   * A meter has at most one segmented message in progress (messages to the same destination are
+#     sent one at a time). A reading generated while the previous one is in progress waits in a FIFO
+#     queue.
 # * **Receiver (DCU).** Reassembly per `(SRC, SeqZero)`.
-#   * When all segments have arrived, the DCU sends a Segment Acknowledgment with all bits set,
-#     immediately by default. Because the DCU completes the message at the end of the last
-#     segment's PDU on one channel while the source is still sending that segment on the next
+#   * Every **new** segment restarts the **SAR acknowledgment timer** with
+#     min(SegN + 0.5, delay increment) × receiver segment interval = min(17.5, 2.5) × 60 ms =
+#     150 ms, and the **SAR discard timer** (10 s). A segment that was already received restarts
+#     neither. So while segments keep arriving every 60 ms the DCU stays silent; it acknowledges
+#     150 ms after the last new segment if some are still missing.
+#   * On expiry of the acknowledgment timer the DCU sends a Segment Acknowledgment with the bitmap
+#     of the segments received so far. If SegN exceeds the segments threshold, it repeats it
+#     `SAR_ACK_RETRANSMISSIONS_COUNT` times, one receiver segment interval apart (default: none).
+#   * When the last missing segment arrives, the timer is cancelled and an acknowledgment with all
+#     bits set is sent immediately. Because the DCU completes the message at the end of that
+#     segment's PDU on one channel while the source is still sending the same segment on the next
 #     channels, the acknowledgment's advertising event starts in lock-step with the source's, and
 #     its copies often overlap the source's own copies (collisions at listeners, half-duplex at the
 #     source). `ACK_DELAY_MS` (default 0–0 ms) adds a uniform host/processing delay before such
-#     segment-triggered acknowledgments to study this; acknowledgments sent on timer expiry are
-#     not delayed.
-#   * Otherwise, the **SAR acknowledgment timer** is started on a segment reception if it is not
-#     running. Its value is min(SegN + 1, SAR Acknowledgment Delay Increment) × SAR Receiver Segment
-#     Interval (150 ms for 18 segments with the defaults). On expiry the DCU sends an acknowledgment
-#     with the bitmap of the segments received so far; the next segment starts the timer again.
-#   * If SegN exceeds `SAR_SEGMENTS_THRESHOLD`, every acknowledgment is followed by
-#     `SAR_ACK_RETRANSMISSIONS_COUNT` copies (new sequence numbers, same bitmap), one receiver
-#     segment interval apart. The default count is 0 (no copies).
-#   * The **SAR discard timer** (10 s) restarts on every segment of the message; on expiry the
-#     partial message is discarded. (Restarting on every segment is our reading of the rule;
-#     with 60 ms segment spacing it only matters for messages that stall for 10 s.)
-#   * A segment of an already completed message triggers a new all-ones acknowledgment
-#     (the previous acknowledgment was evidently lost).
+#     segment-triggered acknowledgments to study this; timer acknowledgments are not delayed.
+#   * A segment of an already completed message is answered with an all-ones acknowledgment, but
+#     at most once per delay increment × receiver segment interval (150 ms).
+#   * On expiry of the discard timer the partial message is discarded; later segments of it are
+#     ignored.
 #   * Acknowledgments are unsegmented control messages (one network PDU), flooded and relayed like
 #     any other PDU. They can collide and be lost.
 # * SeqZero is represented by the full sequence number of the first segment, so it never wraps.
 #
-# **Parameter values.** The formulas and field encodings are those of Mesh Protocol 1.1. The
-# default values in the configuration cell are the ones chosen for this study; **check them against
-# the SAR state defaults in the specification version cited in the paper** (the printed table
-# above lists the field values used).
+# **Check before publishing.** The field defaults above were taken from the Zephyr stack's
+# configuration, which uses the specification's defaults; **confirm them against the SAR state
+# default table of the Mesh Protocol 1.1 specification cited in the paper.**
 #
 # ### 1.5 Traffic and measurement window
 #
@@ -673,7 +691,7 @@ def report_schedule(n_meters: int, interval_us: int, n_periods: int, ss: np.rand
 # | Event | Action |
 # |---|---|
 # | `REPORT` | a meter generates a reading; SAR starts now or after the meter's previous reading |
-# | `SEG_SUBMIT` | the sender hands the next segment of the current round to its radio queue |
+# | `SEG_SUBMIT` | the sender hands the next unacknowledged segment of the round to its radio queue, or ends the round and starts the retransmissions timer |
 # | `TX_START` | a PDU starts on one channel: registered as ongoing on that channel and as "radio busy" at its node |
 # | `TX_END` | a PDU ends: reception is evaluated at every node that could hear it |
 # | `ADV_END` | an advertising event ends: the radio takes the next queued item |
@@ -682,7 +700,7 @@ def report_schedule(n_meters: int, interval_us: int, n_periods: int, ss: np.rand
 # | `ACK_TIMER` | DCU SAR acknowledgment timer: send an acknowledgment with the current bitmap |
 # | `SEG_TX_TIMER` | sender SAR unicast retransmissions timer: retransmit unacknowledged segments |
 # | `DISCARD` | DCU SAR discard timer: discard the partial message |
-# | `ACK_SEND` | a delayed (`ACK_DELAY_MS`) or retransmitted (`SAR_ACK_RETRANSMISSIONS_COUNT`) acknowledgment is queued |
+# | `ACK_SEND` | a segment-triggered acknowledgment is queued after `ACK_DELAY_MS` (only if > 0) |
 #
 # Events at the same time are ordered by (priority, insertion order): `TX_END` < `ADV_END` <
 # `TX_START` < others. Intervals are half-open $[s, e)$, so a PDU that starts exactly when another
@@ -823,18 +841,25 @@ class Reading:
 
 
 class SarTx:
-    """Sender side of one segmented message (lower transport layer of a meter)."""
+    """Sender side of one segmented message (lower transport layer of a meter).
+
+    ``attempts_left`` and ``no_progress_left`` count transmission rounds including the first one
+    (count + 1 each); a round decrements them when it ends.
+    """
     __slots__ = ("reading", "node", "dst", "ttl", "seq_zero", "n_seg", "full", "acked", "round", "sending",
-                 "pending", "ptr", "outstanding", "submission_done", "timer_token", "active", "retx_left",
-                 "no_progress_left")
+                 "pending", "ptr", "active", "attempts_left", "no_progress_left", "ack_received",
+                 "last_adv_start", "timer_token", "step_token")
 
     def __init__(self, reading: Reading, node: int, dst: int, ttl: int, seq_zero: int, n_seg: int,
-                 retx_left: int, no_progress_left: int):
-        self.retx_left, self.no_progress_left = retx_left, no_progress_left
+                 attempts: int, no_progress_attempts: int):
         self.reading, self.node, self.dst, self.ttl, self.seq_zero, self.n_seg = reading, node, dst, ttl, seq_zero, n_seg
         self.full = (1 << n_seg) - 1
         self.acked, self.round, self.sending, self.active = 0, 0, True, True
-        self.pending, self.ptr, self.outstanding, self.submission_done, self.timer_token = list(range(n_seg)), 0, 0, False, 0
+        self.pending, self.ptr = list(range(n_seg)), 0
+        self.attempts_left, self.no_progress_left = attempts, no_progress_attempts
+        self.ack_received = False
+        self.last_adv_start: int | None = None   # start of the latest segment's first advertising event
+        self.timer_token = self.step_token = 0
 
     def needs(self, seg: int) -> bool:
         """True while the message is in progress and ``seg`` is not acknowledged."""
@@ -843,19 +868,19 @@ class SarTx:
 
 class SarRx:
     """Receiver side (DCU) of one segmented message, keyed by (SRC, SeqZero)."""
-    __slots__ = ("key", "reading", "seg_n", "full", "mask", "active", "ack_timer_on", "ack_token", "inc_deadline",
-                 "inc_scheduled")
+    __slots__ = ("key", "reading", "seg_n", "full", "mask", "active", "ack_token", "ack_retx_left",
+                 "discard_deadline", "discard_scheduled")
 
     def __init__(self, key: tuple[int, int], reading: Reading, n_seg: int):
         self.key, self.reading, self.full, self.mask, self.active = key, reading, (1 << n_seg) - 1, 0, True
         self.seg_n = n_seg - 1
-        self.ack_timer_on, self.ack_token, self.inc_deadline, self.inc_scheduled = False, 0, 0, False
+        self.ack_token, self.ack_retx_left, self.discard_deadline, self.discard_scheduled = 0, 0, 0, False
 
 
 class NodeState:
     """Per-node protocol and radio state."""
     __slots__ = ("idx", "is_dcu", "is_relay", "txq", "radio_busy", "seq", "cache", "busy", "sar", "backlog",
-                 "rx", "completed")
+                 "rx", "completed", "discarded")
 
     def __init__(self, idx: int, is_dcu: bool, is_relay: bool):
         self.idx, self.is_dcu, self.is_relay = idx, is_dcu, is_relay
@@ -867,7 +892,8 @@ class NodeState:
         self.sar: SarTx | None = None
         self.backlog: deque[Reading] = deque()
         self.rx: dict[tuple[int, int], SarRx] = {}
-        self.completed: set[tuple[int, int]] = set()
+        self.completed: dict[tuple[int, int], int] = {}   # (SRC, SeqZero) -> time of the latest ack sent
+        self.discarded: set[tuple[int, int]] = set()
 
 
 class MeshSimulator:
@@ -942,8 +968,8 @@ class MeshSimulator:
             elif kind == EV_RELAY:
                 self._submit(a, TxItem(b, self.cfg.relay_retransmit_count, True))
             elif kind == EV_SEG_SUBMIT:
-                if a.active and a.round == b:
-                    self._seg_submit(a)
+                if a.active and a.sending and a.step_token == b:
+                    self._seg_step(a)
             elif kind == EV_REPEAT:
                 self._requeue(a, b)
             elif kind == EV_ACK_TIMER:
@@ -951,7 +977,7 @@ class MeshSimulator:
             elif kind == EV_SEG_TX_TIMER:
                 sar = a
                 if sar.active and not sar.sending and sar.timer_token == b:
-                    self._new_round(sar)
+                    self._retransmit(sar)
             elif kind == EV_DISCARD:
                 self._on_discard(a, b)
             elif kind == EV_REPORT:
@@ -1003,6 +1029,8 @@ class MeshSimulator:
                     r.n_data_tx += 1
                     if r.t_first_tx is None:
                         r.t_first_tx = now
+                    if item.sar is not None:
+                        item.sar.last_adv_start = now
             elif item.relayed:
                 r.n_relay_ack_tx += 1
             else:
@@ -1141,63 +1169,65 @@ class MeshSimulator:
         st = self.nodes[node]
         cfg = self.cfg
         sar = SarTx(reading, node, self.sc.meter_dcu[node], self.sc.meter_ttl[node], st.seq, cfg.n_segments,
-                    cfg.retx_count, cfg.retx_without_progress_count)
+                    cfg.retx_count + 1, cfg.retx_without_progress_count + 1)
         st.sar = sar
-        self._seg_submit(sar)
+        self._seg_step(sar)
 
-    def _seg_submit(self, sar: SarTx) -> None:
-        """Hand the next unacknowledged segment of the current round to the radio queue."""
+    def _retx_interval_us(self, ttl: int) -> int:
+        """SAR unicast retransmissions timer: step + increment x (TTL - 1), or step if TTL = 0."""
+        cfg = self.cfg
+        return cfg.retx_interval_step_us + (cfg.retx_interval_increment_us * (ttl - 1) if ttl > 0 else 0)
+
+    def _seg_step(self, sar: SarTx) -> None:
+        """Send the next unacknowledged segment of the round, or end the round and start the timer."""
         while sar.ptr < len(sar.pending) and (sar.acked >> sar.pending[sar.ptr]) & 1:
             sar.ptr += 1
-        if sar.ptr == len(sar.pending):
-            sar.submission_done = True
-            if sar.outstanding == 0:
-                self._enter_waiting(sar)
+        if sar.ptr < len(sar.pending):
+            seg = sar.pending[sar.ptr]
+            sar.ptr += 1
+            st = self.nodes[sar.node]
+            pdu = NetPdu(SEG, sar.node, sar.dst, st.seq, sar.ttl, sar.seq_zero, seg, sar.n_seg - 1,
+                         reading=sar.reading.id, sar_round=sar.round)
+            st.seq += 1
+            st.cache.add((pdu.src, pdu.seq))
+            sar.ack_received = False
+            self._submit(sar.node, TxItem(pdu, self.cfg.network_transmit_count, False, sar, seg))
             return
-        seg = sar.pending[sar.ptr]
-        sar.ptr += 1
-        st = self.nodes[sar.node]
-        pdu = NetPdu(SEG, sar.node, sar.dst, st.seq, sar.ttl, sar.seq_zero, seg, sar.n_seg - 1,
-                     reading=sar.reading.id, sar_round=sar.round)
-        st.seq += 1
-        st.cache.add((pdu.src, pdu.seq))
-        sar.outstanding += 1
-        if any(not (sar.acked >> s) & 1 for s in sar.pending[sar.ptr:]):
-            self._push(self.now + self.cfg.segment_interval_us, EV_SEG_SUBMIT, sar, sar.round)
-        else:
-            sar.submission_done = True
-        self._submit(sar.node, TxItem(pdu, self.cfg.network_transmit_count, False, sar, seg))
-
-    def _seg_item_done(self, item: TxItem) -> None:
-        """A segment finished its last advertising event (or was skipped)."""
-        sar = item.sar
-        if not sar.active:
-            return
-        sar.outstanding -= 1
-        if sar.submission_done and sar.outstanding == 0 and sar.sending:
-            self._enter_waiting(sar)
-
-    def _enter_waiting(self, sar: SarTx) -> None:
-        """Round finished: start the SAR unicast retransmissions timer (Mesh 1.1)."""
+        # Round finished: one attempt used; it made no progress unless an ack came after the last segment.
+        sar.attempts_left -= 1
+        if not sar.ack_received:
+            sar.no_progress_left -= 1
+        timeout = self.cfg.segment_interval_us if sar.ack_received else self._retx_interval_us(sar.ttl)
+        sar.ack_received = False
         sar.sending = False
         sar.timer_token += 1
-        cfg = self.cfg
-        interval = cfg.retx_interval_step_us + (cfg.retx_interval_increment_us * (sar.ttl - 1) if sar.ttl > 0 else 0)
-        self._push(self.now + interval, EV_SEG_TX_TIMER, sar, sar.timer_token)
+        start = sar.last_adv_start if sar.last_adv_start is not None else self.now
+        self._push(max(self.now, start + timeout), EV_SEG_TX_TIMER, sar, sar.timer_token)
 
-    def _new_round(self, sar: SarTx) -> None:
-        """Retransmit all unacknowledged segments, or cancel when a retransmission counter is exhausted."""
-        if sar.retx_left == 0 or sar.no_progress_left == 0:
+    def _seg_item_done(self, item: TxItem) -> None:
+        """A segment finished its last advertising event (or was skipped): schedule the next step.
+
+        The next segment starts one segment interval after the start of the previous one, and not
+        before the previous one has been transmitted.
+        """
+        sar = item.sar
+        if not sar.active or not sar.sending:
+            return
+        start = sar.last_adv_start if sar.last_adv_start is not None else self.now
+        sar.step_token += 1
+        self._push(max(self.now, start + self.cfg.segment_interval_us), EV_SEG_SUBMIT, sar, sar.step_token)
+
+    def _retransmit(self, sar: SarTx) -> None:
+        """Retransmit all unacknowledged segments, or cancel when an attempt counter is exhausted."""
+        if sar.attempts_left <= 0 or sar.no_progress_left <= 0:
             self._finish_sar(sar, success=False)
             return
-        sar.retx_left -= 1
-        sar.no_progress_left -= 1
         sar.round += 1
         sar.reading.sar_rounds += 1
         sar.pending = [s for s in range(sar.n_seg) if not (sar.acked >> s) & 1]
-        sar.ptr, sar.outstanding, sar.submission_done, sar.sending = 0, 0, False, True
+        sar.ptr, sar.sending = 0, True
         sar.timer_token += 1
-        self._seg_submit(sar)
+        self._seg_step(sar)
 
     def _meter_rx_ack(self, node: int, pdu: NetPdu) -> None:
         st = self.nodes[node]
@@ -1210,11 +1240,19 @@ class MeshSimulator:
         new = pdu.block_ack & sar.full & ~sar.acked
         if new:
             sar.acked |= new
-            sar.no_progress_left = self.cfg.retx_without_progress_count     # progress
+            sar.no_progress_left = self.cfg.retx_without_progress_count + 1     # progress
         if sar.acked == sar.full:
             self._finish_sar(sar, success=True)
         elif not sar.sending:
-            self._new_round(sar)
+            # Timer running: retransmit now (one segment interval after the last segment at the earliest).
+            sar.timer_token += 1
+            if sar.attempts_left <= 0 or sar.no_progress_left <= 0:
+                self._finish_sar(sar, success=False)
+                return
+            start = sar.last_adv_start if sar.last_adv_start is not None else self.now
+            self._push(max(self.now, start + self.cfg.segment_interval_us), EV_SEG_TX_TIMER, sar, sar.timer_token)
+        else:
+            sar.ack_received = True
 
     def _finish_sar(self, sar: SarTx, success: bool) -> None:
         sar.active = False
@@ -1226,72 +1264,87 @@ class MeshSimulator:
             self._start_reading(st.backlog.popleft())
 
     # ---------------------------------------------------------------- SAR receiver (DCU)
+    def _ack_delay_us(self, seg_n: int) -> int:
+        """SAR acknowledgment timer: min(SegN + 0.5, delay increment) x receiver segment interval."""
+        cfg = self.cfg
+        return int(round(min(seg_n + 0.5, cfg.ack_delay_increment) * cfg.rx_segment_interval_us))
+
     def _dcu_rx_segment(self, d: int, pdu: NetPdu) -> None:
         st = self.nodes[d]
+        cfg = self.cfg
         key = (pdu.src, pdu.seq_zero)
         reading = self.readings[pdu.reading]
         full = (1 << (pdu.seg_n + 1)) - 1
         if key in st.completed:
-            self._ack_on_segment(d, pdu.src, pdu.seq_zero, full, reading, pdu.seg_n)
+            # Already reassembled: acknowledge again, at most once per delay-increment x segment interval.
+            if self.now - st.completed[key] > int(round(cfg.ack_delay_increment * cfg.rx_segment_interval_us)):
+                st.completed[key] = self.now
+                self._ack_on_segment(d, pdu.src, pdu.seq_zero, full, reading)
             return
+        if key in st.discarded:
+            return                                  # discarded by the discard timer: ignored
         sess = st.rx.get(key)
         if sess is None:
             sess = st.rx[key] = SarRx(key, reading, pdu.seg_n + 1)
         bit = 1 << pdu.seg_o
+        if sess.mask & bit:
+            return                                  # segment already received: no timer is restarted
         sess.mask |= bit
         reading.seg_mask |= bit
-        cfg = self.cfg
-        sess.inc_deadline = self.now + cfg.discard_timeout_us
-        if not sess.inc_scheduled:
-            sess.inc_scheduled = True
-            self._push(sess.inc_deadline, EV_DISCARD, d, sess)
+        sess.discard_deadline = self.now + cfg.discard_timeout_us
+        if not sess.discard_scheduled:
+            sess.discard_scheduled = True
+            self._push(sess.discard_deadline, EV_DISCARD, d, sess)
+        sess.ack_retx_left = cfg.ack_retx_count
+        sess.ack_token += 1                         # (re)start the acknowledgment timer, or cancel it
         if sess.mask == sess.full:
             sess.active = False
             del st.rx[key]
-            st.completed.add(key)
+            st.completed[key] = self.now
             reading.delivered = True
             reading.t_complete = self.now
-            self._ack_on_segment(d, pdu.src, pdu.seq_zero, full, reading, pdu.seg_n)
-        elif not sess.ack_timer_on:
-            sess.ack_timer_on = True
-            sess.ack_token += 1
-            timer = int(round(min(pdu.seg_n + 1, cfg.ack_delay_increment) * cfg.rx_segment_interval_us))
-            self._push(self.now + timer, EV_ACK_TIMER, (d, sess), sess.ack_token)
+            self._ack_on_segment(d, pdu.src, pdu.seq_zero, full, reading)
+        else:
+            self._push(self.now + self._ack_delay_us(sess.seg_n), EV_ACK_TIMER, (d, sess), sess.ack_token)
 
-    def _ack_on_segment(self, d: int, meter: int, seq_zero: int, mask: int, reading: Reading, seg_n: int) -> None:
+    def _ack_on_segment(self, d: int, meter: int, seq_zero: int, mask: int, reading: Reading) -> None:
         """Acknowledgment triggered by a segment: sent at once, or after ACK_DELAY_MS if configured."""
         lo, hi = self.cfg.ack_delay_us
         if hi <= 0:
-            self._send_ack(d, meter, seq_zero, mask, reading, seg_n)
+            self._send_ack(d, meter, seq_zero, mask, reading)
             return
         rngs = self.sc.ack_delay_rng
         rng = None if rngs is None else rngs[d]
         delay = (lo + hi) // 2 if rng is None else lo + int(rng.random() * (hi - lo + 1))
-        self._push(self.now + delay, EV_ACK_SEND, d, (meter, seq_zero, mask, reading, seg_n))
+        self._push(self.now + delay, EV_ACK_SEND, d, (meter, seq_zero, mask, reading))
 
     def _on_ack_timer(self, arg: tuple[int, SarRx], token: int) -> None:
+        """Acknowledgment timer expired: acknowledge the segments received so far.
+
+        For messages with SegN above the segments threshold the acknowledgment is repeated
+        ``SAR_ACK_RETRANSMISSIONS_COUNT`` times, one receiver segment interval apart.
+        """
         d, sess = arg
         if not sess.active or token != sess.ack_token:
             return
-        sess.ack_timer_on = False
-        self._send_ack(d, sess.key[0], sess.key[1], sess.mask, sess.reading, sess.seg_n)
+        self._send_ack(d, sess.key[0], sess.key[1], sess.mask, sess.reading)
+        if sess.ack_retx_left > 0 and sess.seg_n > self.cfg.segments_threshold:
+            sess.ack_retx_left -= 1
+            self._push(self.now + self.cfg.rx_segment_interval_us, EV_ACK_TIMER, (d, sess), token)
 
     def _on_discard(self, d: int, sess: SarRx) -> None:
         if not sess.active:
             return
-        if self.now < sess.inc_deadline:        # restarted by a later segment: re-arm
-            self._push(sess.inc_deadline, EV_DISCARD, d, sess)
+        if self.now < sess.discard_deadline:    # restarted by a later segment: re-arm
+            self._push(sess.discard_deadline, EV_DISCARD, d, sess)
             return
         sess.active = False
-        del self.nodes[d].rx[sess.key]
+        st = self.nodes[d]
+        del st.rx[sess.key]
+        st.discarded.add(sess.key)
 
-    def _send_ack(self, d: int, meter: int, seq_zero: int, mask: int, reading: Reading, seg_n: int,
-                  copies: bool = True) -> None:
-        """Queue a Segment Acknowledgment; for SegN above the threshold, schedule its retransmissions."""
-        if copies and seg_n > self.cfg.segments_threshold:
-            for k in range(1, self.cfg.ack_retx_count + 1):
-                self._push(self.now + k * self.cfg.rx_segment_interval_us, EV_ACK_SEND, d,
-                           (meter, seq_zero, mask, reading, seg_n, False))
+    def _send_ack(self, d: int, meter: int, seq_zero: int, mask: int, reading: Reading) -> None:
+        """Queue a Segment Acknowledgment (one unsegmented control PDU) to ``meter``."""
         st = self.nodes[d]
         pdu = NetPdu(ACK, d, meter, st.seq, self.sc.meter_ttl[meter], seq_zero, block_ack=mask, reading=reading.id)
         st.seq += 1
@@ -1612,11 +1665,17 @@ def test_without_progress() -> str:
     cfg = test_config(retx_count=5, retx_without_progress_count=1, retx_interval_step_us=ms(400))
     sim = MeshSimulator(line_scenario("MD", relays=set(), ttl={0: 1}, dcu=1), cfg, drop_filter=drop, trace=True)
     r = one_reading(sim, 0)
-    # Round 2 (which delivers segment 5) is only allowed because the ack after round 1 made progress.
-    assert r.delivered and r.sar_rounds == 2, (r.delivered, r.sar_rounds)
+    # Round 2 (which delivers segment 5) is only allowed because the ack after round 1 made progress:
+    # without the reset, the limit of 1 retransmission without progress would cancel after round 1.
+    round2 = [x[0] for x in sim.tx_log if x[1] == 0 and x[2] == SEG and x[7] == 2]
+    round3 = [x[0] for x in sim.tx_log if x[1] == 0 and x[2] == SEG and x[7] == 3]
+    assert r.delivered and round2 and r.t_complete >= min(round2), (r.delivered, r.sar_rounds)
+    assert not round3 or r.t_complete < min(round3), "the DCU should complete in round 2"
+    extra = (f"; the sender missed the final ack and retransmitted {r.sar_rounds - 2} more round(s)"
+             if r.sar_rounds > 2 else "")
     return ("no acknowledgment: cancelled after 2 rounds without progress (5 allowed in total); "
-            "progress in every round: 2 rounds with a without-progress limit of 1, delivered "
-            f"(sender outcome: {r.sender_outcome})")
+            "progress in every round: round 2 allowed with a without-progress limit of 1, DCU completed "
+            f"in round 2{extra}")
 
 
 TESTS = [("1 line delivery", test_line_delivery), ("2 TTL", test_ttl), ("3 cache", test_cache),
