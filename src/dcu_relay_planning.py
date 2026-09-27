@@ -30,7 +30,7 @@
 # | Part | Content |
 # |---|---|
 # | Configuration | All parameters in one cell |
-# | 0 | Setup: packages, versions, HiGHS API detection |
+# | 0 | Setup: packages, versions, Gurobi license |
 # | 1 | Data preparation: cleaning, UTM projection, link budget, adjacency, groups, planning units, hop distances |
 # | 2 | Proposed method: a single MILP (formulation, solver, independent verifier, brute-force check) |
 # | 3 | Baselines: Min-hop + min-relay and All-relay |
@@ -71,12 +71,13 @@ FREQ_HZ = 2.44e9                    # carrier frequency (Hz); PL(d0) is free-spa
 SHADOWING_SIGMA_DB = 6.0            # log-normal shadowing sigma; not used here, exported for simulation
 D_MAX_OVERRIDE_M: float | None = None  # used instead of the computed d_max if not None
 
-# --- MILP (HiGHS) ---------------------------------------------------------------
-TIME_LIMIT_S = 600.0                # per MILP solve
-MIP_REL_GAP = 1e-6                  # relative MIP gap at which HiGHS stops
+# --- MILP (Gurobi) --------------------------------------------------------------
+TIME_LIMIT_S = 600.0                # per MILP solve (Gurobi TimeLimit)
+MIP_REL_GAP = 1e-6                  # relative MIP gap at which Gurobi stops (Gurobi MIPGap)
 TTL_MAX = 127                       # Bluetooth Mesh maximum TTL; caps the hop count H
-RANDOM_SEED = 20240501              # HiGHS random_seed, numpy and random
-HIGHS_LOG = False                   # True = show the HiGHS solver log
+RANDOM_SEED = 20240501              # Gurobi Seed, numpy and random
+SOLVER_LOG = False                  # True = show the Gurobi solver log
+REQUIRE_GUROBI_WLS = True           # stop if the academic WLS license credentials are not found
 
 # --- Verification -----------------------------------------------------------------
 BRUTE_FORCE_MAX_METERS = 12         # size of the instances checked by exhaustive search
@@ -84,12 +85,27 @@ BRUTE_FORCE_MAX_METERS = 12         # size of the instances checked by exhaustiv
 # %% [markdown]
 # ## Part 0 — Setup
 #
-# `highspy` (the Python interface of the HiGHS MILP solver) is not preinstalled on Colab; `pyproj`
+# `gurobipy` (the Python interface of the Gurobi MILP solver) is not preinstalled on Colab; `pyproj`
 # usually is, but it is installed here to be safe. `numpy`, `pandas`, `scipy` and `matplotlib` come
 # with Colab and are not reinstalled, so the runtime does not need a restart.
+#
+# **Gurobi license (academic Web License Service).** Download `gurobi.lic` from the Gurobi
+# Web License Manager and add its three values as **Colab secrets** (key icon in the left
+# sidebar), with notebook access switched on:
+#
+# | Secret name | Value from `gurobi.lic` |
+# |---|---|
+# | `WLSACCESSID` | `WLSACCESSID=...` |
+# | `WLSSECRET` | `WLSSECRET=...` |
+# | `LICENSEID` | `LICENSEID=...` |
+#
+# Outside Colab, environment variables with the same names are used instead. The credentials are
+# never written into the notebook. Without them, `gurobipy` only has its size-limited license
+# (2000 variables and constraints), which is too small for a real site; with
+# `REQUIRE_GUROBI_WLS = True` the notebook stops here with a message instead.
 
 # %%
-# %pip install -q highspy pyproj
+# %pip install -q gurobipy pyproj
 
 # %%
 import collections
@@ -103,7 +119,9 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 
-import highspy
+from gurobipy import GRB
+
+import gurobipy as gp
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
@@ -119,15 +137,6 @@ random.seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
 
 
-def highs_version() -> str:
-    """Return the version of the HiGHS library bundled with ``highspy``."""
-    h = highspy.Highs()
-    if hasattr(h, "version"):
-        return str(h.version())
-    parts = [getattr(highspy, f"HIGHS_VERSION_{k}", None) for k in ("MAJOR", "MINOR", "PATCH")]
-    return ".".join(str(p) for p in parts) if None not in parts else "unknown"
-
-
 def package_version(name: str) -> str:
     """Return the installed version of a distribution package, or 'unknown'."""
     try:
@@ -136,15 +145,71 @@ def package_version(name: str) -> str:
         return "unknown"
 
 
-# The object-oriented modelling interface (addVariable/addConstr) exists in highspy >= 1.7.
-# Older versions only have the low-level matrix interface (addVars/addRows); both are supported.
-HAS_MODELING_API = all(hasattr(highspy.Highs, a) for a in ("addVariable", "addConstr"))
+WLS_KEYS = ("WLSACCESSID", "WLSSECRET", "LICENSEID")
+
+
+def read_wls_credentials() -> dict[str, str] | None:
+    """Read the Gurobi WLS credentials from Colab secrets, else from environment variables.
+
+    Returns:
+        Dict with the three WLS keys, or None if none is set.
+
+    Raises:
+        ValueError: If only some of the three keys are set.
+    """
+    try:
+        from google.colab import userdata  # available on Colab only
+    except ImportError:
+        userdata = None
+    creds = {}
+    for key in WLS_KEYS:
+        value = None
+        if userdata is not None:
+            try:
+                value = userdata.get(key)
+            except Exception:  # secret missing or notebook access not granted
+                value = None
+        value = value or os.environ.get(key)
+        if value:
+            creds[key] = str(value).strip()
+    if not creds:
+        return None
+    if len(creds) < len(WLS_KEYS):
+        raise ValueError(f"Incomplete Gurobi WLS credentials: found {sorted(creds)}, need {list(WLS_KEYS)}.")
+    return creds
+
+
+def start_gurobi_env(require_wls: bool) -> tuple[gp.Env, str]:
+    """Start one Gurobi environment (license session) shared by all models.
+
+    Raises:
+        RuntimeError: If ``require_wls`` and no WLS credentials are found.
+    """
+    creds = read_wls_credentials()
+    if creds is None and require_wls:
+        raise RuntimeError(
+            "Gurobi WLS credentials not found. Add WLSACCESSID, WLSSECRET and LICENSEID as Colab "
+            "secrets (key icon in the left sidebar, notebook access on) or as environment variables, "
+            "or set REQUIRE_GUROBI_WLS = False to use a local gurobi.lic / the size-limited license.")
+    env = gp.Env(empty=True)
+    env.setParam("OutputFlag", 0)
+    if creds:
+        env.setParam("WLSACCESSID", creds["WLSACCESSID"])
+        env.setParam("WLSSECRET", creds["WLSSECRET"])
+        env.setParam("LICENSEID", int(creds["LICENSEID"]))
+    env.start()
+    return env, ("academic WLS" if creds else "local (gurobi.lic or size-limited pip license)")
+
+
+GUROBI_ENV, GUROBI_LICENSE = start_gurobi_env(REQUIRE_GUROBI_WLS)
+# Gurobi status code -> name, e.g. 2 -> 'OPTIMAL', 9 -> 'TIME_LIMIT'.
+GUROBI_STATUS = {getattr(GRB.Status, n): n for n in dir(GRB.Status) if n.isupper()}
 
 print(f"python     {sys.version.split()[0]}")
-for pkg in ("highspy", "pyproj", "numpy", "pandas", "scipy", "matplotlib"):
+for pkg in ("gurobipy", "pyproj", "numpy", "pandas", "scipy", "matplotlib"):
     print(f"{pkg:<10} {package_version(pkg)}")
-print(f"HiGHS      {highs_version()}")
-print(f"HiGHS API  {'modelling interface (addVariable/addConstr)' if HAS_MODELING_API else 'low-level (addVars/addRows)'}")
+print(f"Gurobi     {'.'.join(str(v) for v in gp.gurobi.version())}")
+print(f"license    {GUROBI_LICENSE}")
 
 # %% [markdown]
 # ### Optional: synthetic demo site
@@ -821,7 +886,7 @@ for site in sites.values():
 # the depth of $i$; minimising $\varepsilon \sum h_i$ makes it equal to the depth at the optimum.
 # $h_i \le H \le \text{TTL}_\text{max}$ ensures every planned path is deliverable with a valid TTL.
 #
-# **Optimality of the primary term.** HiGHS reports a lower bound $LB$ on the objective. Because
+# **Optimality of the primary term.** Gurobi reports a lower bound $LB$ on the objective. Because
 # the primary term $P$ ($R$, or the relay count with unit weights) is an integer and the hop term
 # lies in $(0,1)$, the optimal $P^*$ satisfies $P^* > LB - 1$, i.e. $P^* \ge \lfloor LB \rfloor$.
 # The notebook reports this bound, so a run stopped by the time limit still certifies how far its
@@ -832,12 +897,15 @@ for site in sites.values():
 #
 # The model is first built once as sparse arrays (column bounds, costs, integrality and the
 # constraint rows in CSR form); `build_milp` is the only place where the formulation is encoded.
-# It is then loaded into HiGHS through the **modelling interface** (`addVariable` / `addConstr`)
-# when the installed `highspy` has it, and otherwise through the **low-level** interface
-# (`addVars` / `addRows`). Both give the same model; the brute-force check below solves with both.
+# It is then loaded into Gurobi with the matrix interface (`addMVar` / `addMConstr`), so the
+# solver receives exactly these arrays.
 #
-# HiGHS receives a **MIP start** (see 2.3). Before it is passed to HiGHS, the start vector is
+# Gurobi receives a **MIP start** (see 2.3). Before it is passed to Gurobi, the start vector is
 # checked against every row, bound and integrality requirement.
+#
+# Solver settings: `TimeLimit = TIME_LIMIT_S`, `MIPGap = MIP_REL_GAP`, `Seed = RANDOM_SEED`; all
+# other Gurobi parameters keep their defaults. Gurobi is deterministic for a fixed seed, thread
+# count and machine; a run stopped by the time limit can differ between machines.
 
 # %%
 @dataclass
@@ -969,47 +1037,23 @@ def check_point_feasible(model: MilpModel, vec: np.ndarray, tol: float = 1e-9) -
     return problems
 
 
-def _linear_sum(h: highspy.Highs, terms: list) -> object:
-    """Sum of highspy linear expressions, using the fast qsum when available."""
-    return h.qsum(terms) if hasattr(h, "qsum") else sum(terms[1:], terms[0])
-
-
-def load_model(h: highspy.Highs, model: MilpModel, api: str) -> None:
-    """Load ``model`` into a Highs instance with the modelling ('modeling') or 'low-level' API."""
-    if api == "modeling":
-        cols = []
-        for k in range(model.n_cols):
-            vtype = highspy.HighsVarType.kInteger if model.is_int[k] else highspy.HighsVarType.kContinuous
-            cols.append(h.addVariable(lb=model.lb[k], ub=model.ub[k], obj=model.cost[k], type=vtype))
-        if getattr(cols[-1], "index", model.n_cols - 1) != model.n_cols - 1:
-            raise AssertionError("unexpected column order in the modelling interface")
-        for rw in range(model.n_rows):
-            s, e = model.row_start[rw], model.row_start[rw + 1]
-            expr = _linear_sum(h, [float(v) * cols[int(c)] for c, v in zip(model.row_index[s:e], model.row_value[s:e])])
-            lo, hi = model.row_lower[rw], model.row_upper[rw]
-            if lo == hi:
-                h.addConstr(expr == lo)
-            elif np.isinf(lo):
-                h.addConstr(expr <= hi)
-            elif np.isinf(hi):
-                h.addConstr(expr >= lo)
-            else:
-                raise ValueError("ranged rows are not used by this model")
-    elif api == "low-level":
-        inf = highspy.kHighsInf
-        n = model.n_cols
-        h.addVars(n, model.lb, model.ub)
-        h.changeColsCost(n, np.arange(n, dtype=np.int32), model.cost)
-        int_cols = np.flatnonzero(model.is_int).astype(np.int32)
-        h.changeColsIntegrality(len(int_cols), int_cols,
-                                np.array([highspy.HighsVarType.kInteger] * len(int_cols)))
-        h.addRows(model.n_rows, np.where(np.isinf(model.row_lower), -inf, model.row_lower),
-                  np.where(np.isinf(model.row_upper), inf, model.row_upper),
-                  len(model.row_index), model.row_start[:-1], model.row_index, model.row_value)
-    else:
-        raise ValueError(f"unknown api '{api}'")
-    if h.getNumCol() != model.n_cols or h.getNumRow() != model.n_rows:
-        raise AssertionError("HiGHS model size differs from the built model")
+def load_model(gm: gp.Model, model: MilpModel) -> gp.MVar:
+    """Load ``model`` into a Gurobi model with the matrix API; returns the column variables."""
+    vtype = np.where(model.is_int, GRB.INTEGER, GRB.CONTINUOUS)
+    cols = gm.addMVar(model.n_cols, lb=model.lb, ub=model.ub, obj=model.cost, vtype=vtype)
+    lo, hi = model.row_lower, model.row_upper
+    eq = lo == hi
+    le = ~eq & np.isinf(lo)
+    ge = ~eq & np.isinf(hi)
+    if not (eq | le | ge).all():
+        raise ValueError("ranged rows are not used by this model")
+    sense = np.where(eq, GRB.EQUAL, np.where(le, GRB.LESS_EQUAL, GRB.GREATER_EQUAL))
+    gm.addMConstr(model.matrix(), cols, sense, np.where(le, hi, lo))
+    gm.ModelSense = GRB.MINIMIZE
+    gm.update()
+    if gm.NumVars != model.n_cols or gm.NumConstrs != model.n_rows:
+        raise AssertionError("Gurobi model size differs from the built model")
+    return cols
 
 # %% [markdown]
 # ### 2.3 Plans, MIP starts, and the solver
@@ -1044,7 +1088,7 @@ class Plan:
         h: Hop variables from the MILP (rounded), or None for heuristic plans.
         solve_time_s: Wall-clock time to compute the plan.
         status: Solver status ('-' for heuristics).
-        objective, best_bound, gap: HiGHS objective, dual bound and relative gap (MILP only).
+        objective, best_bound, gap: Gurobi objective, best bound and relative gap (MILP only).
         primary_lb: floor(best_bound): lower bound on the optimal redundant rebroadcasts.
         fallback: True if the solver returned no solution and the MIP start was used instead.
     """
@@ -1152,26 +1196,23 @@ def tree_depths(parent: np.ndarray) -> np.ndarray:
 
 
 def solve_milp(unit: PlanningUnit, fixed_site: int | None = None, relay_weight: str = "neighbors", *,
-               mip_start: Plan | None = None, api: str = "auto",
+               mip_start: Plan | None = None,
                time_limit_s: float = TIME_LIMIT_S, method: str | None = None) -> Plan:
-    """Solve the MILP of 2.1 for one planning unit with HiGHS.
+    """Solve the MILP of 2.1 for one planning unit with Gurobi.
 
     Args:
         unit: Planning unit.
         fixed_site: Local candidate index to fix the DCU to, or None to optimise it.
         relay_weight: 'neighbors' (cost |A(j)| per relay, Proposed) or 'unit' (cost 1 per relay,
             Min-hop + min-relay).
-        mip_start: Plan passed to HiGHS as MIP start; default: the all-relay plan at
+        mip_start: Plan passed to Gurobi as MIP start; default: the all-relay plan at
             ``fixed_site`` (or at the minimum-hop pole if the site is free).
-        api: 'auto' (modelling interface if available), 'modeling' or 'low-level'.
-        time_limit_s: HiGHS time limit.
+        time_limit_s: Gurobi time limit.
         method: Name stored in the plan (default 'Proposed' or 'Min-hop + min-relay' by weight).
 
     Returns:
         The extracted plan, including status, objective, best bound, gap and solve time.
     """
-    if api == "auto":
-        api = "modeling" if HAS_MODELING_API else "low-level"
     method = method or {"neighbors": PROPOSED, "unit": MIN_RELAY}[relay_weight]
     model = build_milp(unit, fixed_site, relay_weight)
 
@@ -1179,34 +1220,29 @@ def solve_milp(unit: PlanningUnit, fixed_site: int | None = None, relay_weight: 
     start_vec = plan_to_vector(model, unit, start)
     start_problems = check_point_feasible(model, start_vec)
 
-    h = highspy.Highs()
-    h.setOptionValue("output_flag", bool(HIGHS_LOG))
-    h.setOptionValue("log_to_console", bool(HIGHS_LOG))
-    h.setOptionValue("time_limit", float(time_limit_s))
-    h.setOptionValue("mip_rel_gap", float(MIP_REL_GAP))
-    h.setOptionValue("random_seed", int(RANDOM_SEED))
-    load_model(h, model, api)
+    gm = gp.Model(f"{unit.site}_unit{unit.uid}", env=GUROBI_ENV)
+    gm.Params.OutputFlag = int(bool(SOLVER_LOG))
+    gm.Params.TimeLimit = float(time_limit_s)
+    gm.Params.MIPGap = float(MIP_REL_GAP)
+    gm.Params.Seed = int(RANDOM_SEED)
+    cols = load_model(gm, model)
     if not start_problems:
-        sol = highspy.HighsSolution()
-        sol.col_value = start_vec.tolist()
-        sol.value_valid = True
-        h.setSolution(sol)
+        cols.Start = start_vec
     else:
         print(f"    WARNING: MIP start '{start.method}' infeasible ({start_problems}); solving without it")
 
     t0 = time.perf_counter()
-    h.run()
+    gm.optimize()
     elapsed = time.perf_counter() - t0
-    info = h.getInfo()
-    status = h.modelStatusToString(h.getModelStatus())
-    has_solution = int(info.primal_solution_status) == 2  # kSolutionStatusFeasible
+    status = GUROBI_STATUS.get(gm.Status, str(gm.Status))
 
-    if has_solution:
-        vec = np.asarray(h.getSolution().col_value, dtype=float)
+    if gm.SolCount > 0:
+        vec = np.asarray(cols.X, dtype=float)
         plan = extract_plan(model, unit, vec, method)
-        plan.objective = float(info.objective_function_value)
+        plan.objective = float(gm.ObjVal)
+        plan.gap = float(gm.MIPGap)
     elif not start_problems:
-        print(f"    WARNING: HiGHS returned no solution ({status}); using the MIP start")
+        print(f"    WARNING: Gurobi returned no solution ({status}); using the MIP start")
         plan = extract_plan(model, unit, start_vec, method)
         plan.objective = float(model.cost @ start_vec)
         plan.fallback = True
@@ -1214,9 +1250,12 @@ def solve_milp(unit: PlanningUnit, fixed_site: int | None = None, relay_weight: 
         raise RuntimeError(f"unit {unit.uid}: no solution found ({status})")
     plan.solve_time_s = elapsed
     plan.status = status
-    plan.best_bound = float(info.mip_dual_bound)
-    plan.gap = float(info.mip_gap)
+    try:
+        plan.best_bound = float(gm.ObjBound)
+    except gp.GurobiError:  # no bound available (e.g. stopped before the root node)
+        plan.best_bound = float("nan")
     plan.primary_lb = float(math.floor(plan.best_bound + 1e-6)) if math.isfinite(plan.best_bound) else float("nan")
+    gm.dispose()
     return plan
 
 
@@ -1325,8 +1364,8 @@ def plan_objective(unit: PlanningUnit, ev: dict, relay_weight: str = "neighbors"
 #   + \varepsilon \sum_i \text{hops}_{c,\mathcal{R}}(i) \Big),$$
 #
 # with relay weight $w_j = |A(j)|$ (`"neighbors"`) or $w_j = 1$ (`"unit"`). For **both** weights,
-# the MILP (with both HiGHS interfaces, free site and site fixed to the minimum-hop pole) must
-# reach the same value.
+# the MILP (free site, and site fixed to the minimum-hop pole) must reach the same value with
+# status `OPTIMAL`.
 # Two kinds of instances are checked: four small sparse synthetic sites, and a connected
 # sub-network of up to `BRUTE_FORCE_MAX_METERS` meters cut from the largest planning unit of the
 # first real site (with the poles in range of its first meter as candidates).
@@ -1400,10 +1439,9 @@ def site_from_frames(name: str, meters: pd.DataFrame, poles: pd.DataFrame, d_max
 
 
 def brute_force_check(unit: PlanningUnit, label: str) -> None:
-    """Compare MILP optima (both relay weights, both APIs, free and fixed site) with exhaustive search."""
+    """Compare MILP optima (both relay weights, free and fixed site) with exhaustive search."""
     print(f"\nBrute-force check '{label}': {unit.N} meters, {unit.C} candidates, "
           f"{2 ** unit.N} relay subsets")
-    apis = ["low-level"] + (["modeling"] if HAS_MODELING_API else [])
     k_fix = min_hop_site(unit)[0]
     for weight in RELAY_WEIGHTS:
         bf_obj, bf_k, bf_relays = brute_force_optimum(unit, relay_weight=weight)
@@ -1411,17 +1449,16 @@ def brute_force_check(unit: PlanningUnit, label: str) -> None:
         print(f"  [{weight}] exhaustive search: objective {bf_obj:.6f} (R = {int(unit.degree[bf_relays].sum())}, "
               f"{int(bf_relays.sum())} relays), site {bf_k}, relays {np.flatnonzero(bf_relays).tolist()}; "
               f"at site {k_fix}: {bf_fix:.6f}")
-        for api in apis:
-            for fixed, target in ((None, bf_obj), (k_fix, bf_fix)):
-                plan = solve_milp(unit, fixed_site=fixed, relay_weight=weight, api=api)
-                ev = verify_plan(unit, plan)
-                obj_plan = plan_objective(unit, ev, weight)
-                ok = (abs(plan.objective - target) < 1e-6 and abs(obj_plan - target) < 1e-6
-                      and plan.status == "Optimal")
-                print(f"  MILP [{weight:<9} {api:<9} site={'free' if fixed is None else f'fixed {fixed}'}]: "
-                      f"HiGHS objective {plan.objective:.6f}, verified plan objective {obj_plan:.6f}, "
-                      f"target {target:.6f}, status {plan.status} -> {'OK' if ok else 'MISMATCH'}")
-                assert ok, "MILP does not match the exhaustive search"
+        for fixed, target in ((None, bf_obj), (k_fix, bf_fix)):
+            plan = solve_milp(unit, fixed_site=fixed, relay_weight=weight)
+            ev = verify_plan(unit, plan)
+            obj_plan = plan_objective(unit, ev, weight)
+            ok = (abs(plan.objective - target) < 1e-6 and abs(obj_plan - target) < 1e-6
+                  and plan.status == "OPTIMAL")
+            print(f"  MILP [{weight:<9} site={'free' if fixed is None else f'fixed {fixed}'}]: "
+                  f"Gurobi objective {plan.objective:.6f}, verified plan objective {obj_plan:.6f}, "
+                  f"target {target:.6f}, status {plan.status} -> {'OK' if ok else 'MISMATCH'}")
+            assert ok, "MILP does not match the exhaustive search"
 
 
 for seed_offset in range(1, 5):  # several sparse synthetic layouts
@@ -1509,12 +1546,12 @@ for site in sites.values():
 #
 # Per site and method the metrics are aggregated over the site's planning units: DCUs (one per
 # unit), relays, redundant rebroadcasts $R$, mean and max tree and flooding hops (over all planned
-# meters), total solve time (HiGHS time; none for All-relay), MILP statuses and the largest MIP
+# meters), total solve time (Gurobi time; none for All-relay), MILP statuses and the largest MIP
 # gap. `primary lower bound` is $\sum_\text{units} \lfloor LB \rfloor$ (see 2.1): a lower bound on
 # $R$ for Proposed and on the relay count for Min-hop + min-relay. If it equals the achieved
 # value, the primary term is proven optimal.
 #
-# The per-unit tables give every MILP solve as HiGHS reported it (status, objective, best bound,
+# The per-unit tables give every MILP solve as Gurobi reported it (status, objective, best bound,
 # gap), the Proposed pole versus the minimum-hop pole, and whether Proposed and
 # Min-hop + min-relay select the same relay set.
 
@@ -1579,7 +1616,7 @@ unit_comparison.to_csv(RESULTS_DIR / "unit_site_comparison.csv", index=False)
 
 with pd.option_context("display.max_columns", None, "display.width", 250, "display.float_format", "{:.3f}".format):
     print(summary.to_string(index=False))
-    print("\nMILP solves as reported by HiGHS:")
+    print("\nMILP solves as reported by Gurobi:")
     print(milp_solves.to_string(index=False))
     print(f"\n{PROPOSED} vs {MIN_RELAY} per planning unit (pole and relay set):")
     print(unit_comparison.to_string(index=False))

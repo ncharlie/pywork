@@ -2,7 +2,7 @@
 
 `notebooks/dcu_relay_planning.ipynb` is a Google Colab notebook that picks, for each site, the
 data concentrator unit (DCU) pole and the set of relay meters for a Bluetooth Mesh smart
-metering network. The proposed method is a single MILP (solved with HiGHS) that minimises
+metering network. The proposed method is a single MILP (solved with Gurobi) that minimises
 redundant rebroadcasts under managed flooding and uses hop count only to break ties. It is
 compared with two baselines at the minimum-hop site: **Min-hop + min-relay** (the same MILP with
 the site fixed and every relay weighted 1) and **All-relay** (every meter relays).
@@ -17,6 +17,11 @@ the site fixed and every relay weighted 1) and **All-relay** (every meter relays
    ```
 3. Edit the configuration cell if needed (for example `SITES`, `TIME_LIMIT_S`), then choose
    *Runtime → Run all*.
+
+The MILPs are solved with Gurobi under an academic Web License Service (WLS) license. Add the
+`WLSACCESSID`, `WLSSECRET` and `LICENSEID` values from your `gurobi.lic` as Colab secrets (key
+icon in the left sidebar, notebook access on) before running. Outside Colab, set them as
+environment variables.
 
 To try the notebook without data, set `GENERATE_DEMO_SITE = True`.
 
