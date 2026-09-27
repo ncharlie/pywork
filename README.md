@@ -47,26 +47,24 @@ Mesh over the advertising bearer. It evaluates the plans in `<site>_plans.json`.
 200-byte reading every interval as 18 SAR segments. The segments are flooded through the planned
 relays and acknowledged by the DCU, following the Mesh Protocol 1.1 SAR rules (SAR Transmitter and
 SAR Receiver states, including the retransmission counters with and without progress). All transmissions of a site share the three advertising
-channels, so they can collide. The notebook explains the model and every assumption, runs six
-deterministic validation tests and a reproducibility check before the main runs, and uses common
-random numbers across methods.
+channels, so they can collide. The notebook explains the model and every assumption, runs seven
+deterministic validation tests and a reproducibility check before the main runs, uses common
+random numbers across methods, and checks after the runs whether the number of Monte Carlo runs
+is enough to tell the methods apart.
 
-## Usage
+## Usage (SageMaker Studio)
 
-1. Upload the plan files to `/content/results/<site>_plans.json`.
+1. Copy the plan files to `/home/sagemaker-user/plans/<site>_plans.json`.
 2. Edit the configuration cell if needed (for example `SITES`, `INTERVALS_MIN = [15, 5, 1]`, `N_RUNS`,
-   `OFFSET_MODE`, `COLLISION_MODEL`, `N_WORKERS`), then choose *Runtime → Run all*.
+   `OFFSET_MODE`, `COLLISION_MODEL`), then choose *Run → Run All Cells*.
 
-The simulations run in `N_WORKERS` processes (default 2), shortest reporting interval first; each
-process takes the next simulation from the queue when it finishes one. Results are identical to a
-single-process run, which the notebook checks before the main runs.
-
-## Outputs (`results/`)
+## Outputs (`/home/sagemaker-user/results/<site>/`)
 
 | File | Content |
 |---|---|
-| `sim_runs.csv` | One row per site, method, interval and run: PDR, segment delivery ratio, latency (mean, median, p95), transmissions per reading by type, collisions, SAR rounds |
-| `sim_summary.csv` | Mean and 95 % confidence interval over runs per site, method and interval |
+| `sim_runs.csv` | One row per method, interval and run: PDR, segment delivery ratio, latency (mean, median, p95), transmissions per reading by type, collisions, SAR rounds |
+| `sim_summary.csv` | Mean and 95 % confidence interval over runs per method and interval |
+| `sim_run_adequacy.csv` | Per pair of methods and metric: mean per-run difference, its 95 % CI, and whether the number of runs is enough |
 | `sim_table.tex` | LaTeX `tabular` (Site, Method, PDR, Collisions, Latency) per interval |
 | `sim_per_meter_runs.csv`, `sim_per_meter.csv` | Per-meter delivered readings, per run and pooled |
 | `sim_metadata.json` | Configuration and package versions |

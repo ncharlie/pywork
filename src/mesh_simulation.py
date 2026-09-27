@@ -33,13 +33,14 @@
 # | 4 | Simulator |
 # | 5 | Validation tests (must pass before the main runs) |
 # | 6 | Main simulation runs |
-# | 7 | Results: CSV, summary with 95 % confidence intervals, LaTeX table, plots |
+# | 7 | Results: CSV, summary with 95 % confidence intervals, check of the number of runs, LaTeX table, plots |
 #
-# **Input.** Upload the planning notebook's output files to the Colab runtime:
+# **Input.** Copy the planning notebook's output files to
 # ```
-# /content/results/<site>_plans.json
+# /home/sagemaker-user/plans/<site>_plans.json
 # ```
-# Then choose *Runtime → Run all*. Outputs are written to `results/` (next to the plan files).
+# Then choose *Run → Run All Cells*. Outputs are written to `/home/sagemaker-user/results/<site>/`,
+# one folder per site.
 #
 # Coordinates in the plan files are local (metres) and confidential, so no plot uses a basemap.
 
@@ -54,7 +55,8 @@
 from pathlib import Path
 
 # --- Input / output -------------------------------------------------------------
-RESULTS_DIR = Path("results")        # holds <site>_plans.json; outputs are written here too
+PLANS_DIR = Path("/home/sagemaker-user/plans")     # holds <site>_plans.json from the planning notebook
+OUTPUT_DIR = Path("/home/sagemaker-user/results")  # outputs go to OUTPUT_DIR/<site>/
 SITES: list[str] | None = None       # e.g. ["chiangrai"]; None = every <site>_plans.json found
 METHODS: list[str] = ["Proposed", "Min-hop + min-relay", "All-relay"]  # order used in tables/plots
 
@@ -114,18 +116,22 @@ SAR_RECEIVER_SEGMENT_INTERVAL_MS = 60.0  # SAR Receiver Segment Interval Step: (
 SAR_ACK_RETRANSMISSIONS_COUNT = 0    # extra copies of each acknowledgment (if SegN > threshold)
 SAR_DISCARD_TIMEOUT_S = 10.0         # SAR Discard Timeout: (value + 1) x 5 s
 
-# --- Parallel execution -------------------------------------------------------------------
-N_WORKERS = 2                        # worker processes (1 = run in this process); capped at the CPU count
-
 # --- Output ---------------------------------------------------------------------------
 LATEX_COLLISION_METRIC = "collisions_relay_dcu_per_reading"  # column shown as "Collisions" in LaTeX
 FIG_DPI = 200
 
+# --- Check of the number of runs -------------------------------------------------------------
+# For every pair of methods, the per-run difference of each metric below is averaged over the runs
+# with a 95 % t confidence interval. The number of runs is enough for a metric if the interval
+# excludes zero and its half-width is at most ADEQUACY_MAX_RELATIVE_HALF_WIDTH x |mean difference|.
+ADEQUACY_METRICS = ["pdr", "latency_mean_ms", "collisions_relay_dcu_per_reading"]
+ADEQUACY_MAX_RELATIVE_HALF_WIDTH = 0.5
+
 # %% [markdown]
 # ## Part 0 — Setup and derived constants
 #
-# Only the Python standard library, `numpy`, `pandas` and `matplotlib` are used; all come with
-# Colab, so nothing is installed. The event queue is a `heapq` binary heap.
+# Only the Python standard library, `numpy`, `pandas` and `matplotlib` are used; all come with the
+# standard SageMaker Studio Python image, so nothing is installed. The event queue is a `heapq` binary heap.
 #
 # **Time unit.** The simulator keeps time as an **integer number of microseconds**. The airtime of
 # one PDU (376 µs) is exact, overlap tests have no floating-point ties, and results are bit-for-bit
@@ -137,16 +143,12 @@ import heapq
 import importlib.metadata
 import json
 import math
-import multiprocessing as mp
-import os
 import platform
 import random
 import sys
 import time
-import warnings
 import zlib
 from collections import deque
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -444,7 +446,7 @@ print(f"Intervals (min)             : {INTERVALS}, offset mode '{OFFSET_MODE}', 
 # %% [markdown]
 # ## Part 2 — Plan loader
 #
-# The loader reads every `<site>_plans.json` in `RESULTS_DIR`, checks every field the simulator
+# The loader reads every `<site>_plans.json` in `PLANS_DIR`, checks every field the simulator
 # needs, and fails with a message naming the file and the missing field. Meter and pole IDs are
 # separate name spaces in the files (meter "9" and pole "9" are different devices), so they are kept
 # apart internally.
@@ -567,7 +569,7 @@ def discover_sites(results_dir: Path, sites: list[str] | None) -> list[Path]:
     """Return the plan files to simulate, optionally restricted to ``sites``."""
     files = sorted(results_dir.glob("*_plans.json"))
     if not files:
-        raise FileNotFoundError(f"No '*_plans.json' in {results_dir.resolve()}. Upload the planning "
+        raise FileNotFoundError(f"No '*_plans.json' in {results_dir.resolve()}. Copy the planning "
                                 f"notebook's output to {results_dir}/ first.")
     by_name = {f.name.removesuffix("_plans.json"): f for f in files}
     if sites is None:
@@ -578,7 +580,7 @@ def discover_sites(results_dir: Path, sites: list[str] | None) -> list[Path]:
     return [by_name[s] for s in sites]
 
 
-SITE_PLANS = [load_site_plans(p, METHODS) for p in discover_sites(RESULTS_DIR, SITES)]
+SITE_PLANS = [load_site_plans(p, METHODS) for p in discover_sites(PLANS_DIR, SITES)]
 for sp in SITE_PLANS:
     print(f"Site {sp.name}: {len(sp.meter_ids)} meters ({len(sp.uncovered)} uncovered), "
           f"{len(sp.pole_ids)} poles, {len(sp.units)} planning units")
@@ -1695,25 +1697,14 @@ print("\nAll validation tests passed.")
 # %% [markdown]
 # ## Part 6 — Main simulation runs
 #
-# Each simulation (site, interval, run, method) is an independent task: it rebuilds its shadowing
-# matrix, scan phases, report times and node streams from the seeds, so the three methods of a run
-# still share their random draws (common random numbers) no matter where or when they run.
+# Loop order: site → interval → run → method. Every simulation rebuilds its shadowing matrix, scan
+# phases, report times and node streams from the seeds, so the three methods of a run share their
+# random draws (common random numbers).
 #
-# **Two cores.** The tasks run in `N_WORKERS` worker processes (Python threads would not run the
-# simulator in parallel). The queue holds the **shortest reporting interval first**, then the next
-# one, and so on (within an interval: site, run, method). Each worker takes the next task from the
-# queue as soon as it finishes its current one, so no core idles while tasks remain. Workers are
-# started with `fork` (Linux, as on Colab), so they inherit everything defined in this notebook.
-# Results do not depend on the number of workers or the completion order: rows are sorted before
-# they are saved.
+# **Reproducibility check.** Before the main loop, one short simulation (3 measured periods of the
+# first site, method and interval) is run twice with the same seed; the metrics must be identical.
 #
-# **Checks before the main runs.**
-# * *Reproducibility*: one short simulation (3 measured periods) is run twice with the same seed;
-#   the metrics must be identical.
-# * *Parallel = serial*: the three methods of that short simulation are run in the worker pool and
-#   in this process; the results must be identical.
-#
-# `results/sim_runs.csv` is rewritten after every finished task, so an interrupted run keeps the rows
+# Each site's `sim_runs.csv` is rewritten after every run, so an interrupted job keeps the rows
 # finished so far.
 
 # %%
@@ -1772,103 +1763,53 @@ print(f"Reproducibility check passed ({_su.plans.name}, {_m}, {_iv:g} min, 3 per
       f"{_a['n_events']} events)")
 
 # %%
-Task = tuple[int, float, int, str, int]   # (site index, interval in min, run, method, measured periods)
-FORK_AVAILABLE = "fork" in mp.get_all_start_methods()
-WORKERS = max(1, min(N_WORKERS, os.cpu_count() or 1)) if FORK_AVAILABLE else 1
-print(f"CPUs reported: {os.cpu_count()}, worker processes: {WORKERS}"
-      + ("" if FORK_AVAILABLE else " ('fork' is not available on this platform: running serially)"))
+def site_dir(site: str) -> Path:
+    """Output folder of one site (OUTPUT_DIR/<site>/, with a figures/ subfolder)."""
+    d = OUTPUT_DIR / site
+    (d / "figures").mkdir(parents=True, exist_ok=True)
+    return d
 
 
-def run_task(task: Task) -> tuple[Task, dict, list[dict]]:
-    """Worker entry point: simulate one (site, interval, run, method)."""
-    si, interval, run, method, n_periods = task
-    row, pm, _ = simulate(UNIVERSES[si], method, interval, run, n_periods=n_periods)
-    return task, row, pm
-
-
-def task_queue(n_periods: int = N_PERIODS) -> list[Task]:
-    """All tasks, shortest reporting interval first; within an interval by site, run and method."""
-    return [(si, iv, run, m, n_periods) for iv in sorted(set(INTERVALS)) for si in range(len(UNIVERSES))
-            for run in range(N_RUNS) for m in METHODS]
-
-
-def run_tasks(tasks: list[Task], n_workers: int,
-              on_result: Callable[[Task, dict, list[dict]], None]) -> None:
-    """Run tasks in order, in this process or in a pool of forked workers (next task to the first free worker)."""
-    if n_workers <= 1:
-        for t in tasks:
-            on_result(*run_task(t))
-        return
-    with warnings.catch_warnings():
-        # Python >= 3.12 warns about fork() in a multi-threaded process (the Jupyter kernel has helper
-        # threads). The workers only run the simulator and print nothing, so this is safe here.
-        warnings.filterwarnings("ignore", message=".*fork.*", category=DeprecationWarning)
-        pool = ProcessPoolExecutor(max_workers=n_workers, mp_context=mp.get_context("fork"))
-        try:
-            futures = [pool.submit(run_task, t) for t in tasks]   # the pool hands them out in this order
-            for f in as_completed(futures):
-                on_result(*f.result())
-        except BaseException:
-            pool.shutdown(wait=True, cancel_futures=True)
-            raise
-        pool.shutdown(wait=True)
-
-
-def row_key(row: dict) -> tuple:
-    """Sort key of a result row: site, interval (as listed in INTERVALS), run, method."""
-    return (row["site"], INTERVALS.index(row["interval_min"]), row["run"], METHODS.index(row["method"]))
-
-
-if WORKERS > 1:
-    # Parallel = serial check on a short task set.
-    check = [(0, sorted(INTERVALS)[0], 0, m, 3) for m in METHODS]
-    serial, parallel = {}, {}
-    run_tasks(check, 1, lambda t, row, pm: serial.__setitem__(t, (row, pm)))
-    run_tasks(check, WORKERS, lambda t, row, pm: parallel.__setitem__(t, (row, pm)))
-    strip = lambda row: {k: v for k, v in row.items() if k != "wall_time_s"}
-    assert all(strip(serial[t][0]) == strip(parallel[t][0]) and serial[t][1] == parallel[t][1] for t in check), \
-        "Results differ between the worker pool and this process"
-    print(f"Parallel = serial check passed ({len(check)} short simulations on {WORKERS} workers)")
-
-# %%
-RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+config_snapshot = {k: (str(v) if isinstance(v, Path) else v) for k, v in globals().items()
+                   if k.isupper() and isinstance(v, (int, float, str, list, tuple, type(None), Path))}
 run_rows: list[dict] = []
 meter_rows: list[dict] = []
-tasks = task_queue()
+n_total = len(UNIVERSES) * len(INTERVALS) * N_RUNS * len(METHODS)
 t_start = time.perf_counter()
-print(f"{len(tasks)} simulations on {WORKERS} worker(s); queue order: intervals {sorted(set(INTERVALS))} min")
-
-
-def collect(task: Task, row: dict, pm: list[dict]) -> None:
-    """Store one finished simulation, print progress, and checkpoint the CSV."""
-    run_rows.append(row)
-    meter_rows.extend(pm)
-    elapsed = time.perf_counter() - t_start
-    print(f"[{len(run_rows):>4}/{len(tasks)} {elapsed / 60:6.1f} min] {row['site']} | {row['method']:<20} | "
-          f"{row['interval_min']:g} min | run {row['run'] + 1}/{N_RUNS} | PDR {100 * row['pdr']:6.2f} % | "
-          f"latency {row['latency_mean_ms']:7.1f} ms | coll. {row['collisions_relay_dcu_per_reading']:8.2f}/reading | "
-          f"{row['n_events'] / 1e6:5.2f} M events, {row['wall_time_s']:6.1f} s", flush=True)
-    if row["unresolved_readings"]:
-        print(f"    warning: {row['unresolved_readings']} measured readings still in progress at the end")
-    pd.DataFrame(sorted(run_rows, key=row_key)).to_csv(RESULTS_DIR / "sim_runs.csv", index=False)
-
-
-run_tasks(tasks, WORKERS, collect)
+for su in UNIVERSES:
+    site = su.plans.name
+    out = site_dir(site)
+    print(f"=== Site {site} (output: {out}) ===")
+    site_rows: list[dict] = []
+    site_meter_rows: list[dict] = []
+    for interval in INTERVALS:
+        for run in range(N_RUNS):
+            for method in METHODS:
+                row, pm, _ = simulate(su, method, interval, run)
+                site_rows.append(row)
+                site_meter_rows.extend(pm)
+                done = len(run_rows) + len(site_rows)
+                print(f"[{done:>4}/{n_total} {(time.perf_counter() - t_start) / 60:6.1f} min] {site} | {method:<20} | "
+                      f"{interval:g} min | run {run + 1}/{N_RUNS} | PDR {100 * row['pdr']:6.2f} % | "
+                      f"latency {row['latency_mean_ms']:7.1f} ms | "
+                      f"coll. {row['collisions_relay_dcu_per_reading']:8.2f}/reading | "
+                      f"{row['n_events'] / 1e6:5.2f} M events, {row['wall_time_s']:6.1f} s", flush=True)
+                if row["unresolved_readings"]:
+                    print(f"    warning: {row['unresolved_readings']} measured readings still in progress at the end")
+            pd.DataFrame(site_rows).to_csv(out / "sim_runs.csv", index=False)
+    pd.DataFrame(site_rows).to_csv(out / "sim_runs.csv", index=False)
+    pd.DataFrame(site_meter_rows).to_csv(out / "sim_per_meter_runs.csv", index=False)
+    (out / "sim_metadata.json").write_text(json.dumps(
+        {"site": site, "versions": VERSIONS, "config": config_snapshot, "n_segments": N_SEGMENTS,
+         "airtime_us": AIRTIME_US, "plan_file": str(su.plans.path)}, indent=1, default=str))
+    print(f"Saved {out / 'sim_runs.csv'} ({len(site_rows)} rows), {out / 'sim_per_meter_runs.csv'}, "
+          f"{out / 'sim_metadata.json'}")
+    run_rows.extend(site_rows)
+    meter_rows.extend(site_meter_rows)
 print(f"Total wall time {time.perf_counter() - t_start:.0f} s")
-run_rows.sort(key=row_key)
-meter_rows.sort(key=lambda r: (*row_key(r), r["meter_id"]))
 
 runs = pd.DataFrame(run_rows)
 per_meter_runs = pd.DataFrame(meter_rows)
-runs.to_csv(RESULTS_DIR / "sim_runs.csv", index=False)
-per_meter_runs.to_csv(RESULTS_DIR / "sim_per_meter_runs.csv", index=False)
-config_snapshot = {k: (str(v) if isinstance(v, Path) else v) for k, v in globals().items()
-                   if k.isupper() and isinstance(v, (int, float, str, list, tuple, type(None), Path))}
-(RESULTS_DIR / "sim_metadata.json").write_text(json.dumps(
-    {"versions": VERSIONS, "config": config_snapshot, "n_segments": N_SEGMENTS, "airtime_us": AIRTIME_US,
-     "plan_files": [str(sp.path) for sp in SITE_PLANS]}, indent=1, default=str))
-print(f"Saved {RESULTS_DIR / 'sim_runs.csv'} ({len(runs)} rows), {RESULTS_DIR / 'sim_per_meter_runs.csv'}, "
-      f"{RESULTS_DIR / 'sim_metadata.json'}")
 
 # %% [markdown]
 # ## Part 7 — Results
@@ -1921,7 +1862,6 @@ def summarize(runs: pd.DataFrame) -> pd.DataFrame:
 
 
 summary = summarize(runs)
-summary.to_csv(RESULTS_DIR / "sim_summary.csv", index=False)
 show = summary[["site", "method", "interval_min", "runs", "n_relays"]].copy()
 for m, scale, fmt in (("pdr", 100, "{:.2f} ± {:.2f}"), ("seg_delivery_ratio", 100, "{:.2f} ± {:.2f}"),
                       ("latency_mean_ms", 1, "{:.0f} ± {:.0f}"), ("latency_p95_ms", 1, "{:.0f} ± {:.0f}"),
@@ -1934,7 +1874,100 @@ show = show.rename(columns={"pdr": "PDR (%)", "seg_delivery_ratio": "segments (%
                             "collisions_relay_dcu_per_reading": "coll. relay+DCU / reading",
                             "sar_rounds_per_reading": "SAR rounds / reading"})
 print(show.to_string(index=False))
-print(f"\nSaved {RESULTS_DIR / 'sim_summary.csv'}")
+for site, g in summary.groupby("site", sort=False):
+    g.to_csv(site_dir(site) / "sim_summary.csv", index=False)
+    print(f"Saved {site_dir(site) / 'sim_summary.csv'}")
+
+# %% [markdown]
+# ### Is the number of runs enough?
+#
+# The methods of one run share their random draws, so they are compared **run by run**. For every
+# site, interval, metric in `ADEQUACY_METRICS` and pair of methods A, B:
+#
+# 1. per run, the difference $d_r = \text{metric}_A - \text{metric}_B$;
+# 2. its mean $\bar d$ and 95 % confidence interval $\bar d \pm t_{0.975,\,R-1}\, s_d / \sqrt{R}$
+#    over the $R$ runs ($t_{0.975,9} = 2.262$ for 10 runs);
+# 3. verdict:
+#    * **enough** — the interval excludes zero and its half-width is at most
+#      `ADEQUACY_MAX_RELATIVE_HALF_WIDTH` × $|\bar d|$ (default 0.5): the sign and the size of the
+#      difference are established;
+#    * **flag: includes zero** — the runs cannot tell whether A or B is better;
+#    * **flag: wide** — the sign is clear, but the size of the difference is not.
+#
+# For flagged comparisons, *runs needed* estimates how many runs would give a half-width of
+# `ADEQUACY_MAX_RELATIVE_HALF_WIDTH` × $|\bar d|$ if the mean and standard deviation of the
+# difference stayed as they are (smallest $R$ with $t_{0.975,R-1}\, s_d/\sqrt R \le$ target). It is
+# a guide only: if the true difference is (close to) zero, no number of runs will make it
+# significant, and the estimate is then very large or not given.
+
+# %%
+def runs_needed(sd: float, mean: float, rel: float, limit: int = 10_000) -> int | None:
+    """Smallest R with t_{0.975,R-1} * sd / sqrt(R) <= rel * |mean|, or None if above ``limit``."""
+    target = rel * abs(mean)
+    if sd == 0:
+        return 2 if target > 0 else None
+    for r in range(2, limit + 1):
+        if t_quantile_975(r - 1) * sd / math.sqrt(r) <= target:
+            return r
+    return None
+
+
+def run_adequacy(runs: pd.DataFrame) -> pd.DataFrame:
+    """Paired per-run differences between methods, their 95 % CI and a verdict on the number of runs."""
+    rows = []
+    rel = ADEQUACY_MAX_RELATIVE_HALF_WIDTH
+    for (site, interval), g in runs.groupby(["site", "interval_min"], sort=False):
+        wide = g.pivot_table(index="run", columns="method", values=ADEQUACY_METRICS, aggfunc="first")
+        for metric in ADEQUACY_METRICS:
+            for i, a in enumerate(METHODS):
+                for b in METHODS[i + 1:]:
+                    d = (wide[(metric, a)] - wide[(metric, b)]).dropna().to_numpy(dtype=float)
+                    n = len(d)
+                    mean = float(d.mean()) if n else float("nan")
+                    sd = float(d.std(ddof=1)) if n > 1 else float("nan")
+                    t = t_quantile_975(n - 1)
+                    hw = t * sd / math.sqrt(n) if n > 1 else float("nan")
+                    lo, hi = mean - hw, mean + hw
+                    if n < 2:
+                        verdict = "flag: fewer than 2 runs"
+                    elif sd == 0 and mean == 0:
+                        verdict = "flag: includes zero (identical in every run)"
+                    elif lo <= 0 <= hi:
+                        verdict = "flag: includes zero"
+                    elif hw > rel * abs(mean):
+                        verdict = "flag: wide"
+                    else:
+                        verdict = "enough"
+                    need = None if verdict == "enough" or n < 2 else runs_needed(sd, mean, rel)
+                    rows.append({"site": site, "interval_min": interval, "metric": metric,
+                                 "comparison": f"{a} - {b}", "runs": n, "mean_diff": mean, "sd_diff": sd,
+                                 "t": t, "ci95_half_width": hw, "ci95_low": lo, "ci95_high": hi,
+                                 "half_width_over_mean": hw / abs(mean) if mean else float("inf"),
+                                 "verdict": verdict, "runs_needed_estimate": need})
+    return pd.DataFrame(rows)
+
+
+adequacy = run_adequacy(runs)
+scale = {"pdr": 100.0}   # report PDR differences in percentage points
+for site, g in adequacy.groupby("site", sort=False):
+    g.to_csv(site_dir(site) / "sim_run_adequacy.csv", index=False)
+    print(f"\n=== Site {site}: is N_RUNS = {N_RUNS} enough? (95 % CI of the per-run difference, "
+          f"'enough' = excludes 0 and half-width <= {ADEQUACY_MAX_RELATIVE_HALF_WIDTH:g} x |mean|) ===")
+    for _, r in g.iterrows():
+        k = scale.get(r["metric"], 1.0)
+        unit = " pp" if r["metric"] == "pdr" else ""
+        need = "" if r["verdict"] == "enough" else (
+            f"  -> about {int(r['runs_needed_estimate'])} runs needed" if pd.notna(r["runs_needed_estimate"])
+            else "  -> no estimate: the mean difference is 0" if r["mean_diff"] == 0
+            else "  -> more than 10,000 runs needed (difference ~ 0)")
+        print(f"  {r['interval_min']:g} min | {r['metric']:<33} | {r['comparison']:<42} | "
+              f"{k * r['mean_diff']:+9.3f} ± {k * r['ci95_half_width']:7.3f}{unit} "
+              f"[{k * r['ci95_low']:+9.3f}, {k * r['ci95_high']:+9.3f}] | {r['verdict']}{need}")
+    n_flag = int((g["verdict"] != "enough").sum())
+    print(f"  -> {len(g) - n_flag} of {len(g)} comparisons are conclusive with {N_RUNS} runs; "
+          + ("all differences are established." if n_flag == 0 else
+             f"{n_flag} flagged: increase N_RUNS, or report those differences as not significant."))
+    print(f"Saved {site_dir(site) / 'sim_run_adequacy.csv'}")
 
 # %% [markdown]
 # ### Transmissions per reading
@@ -1943,16 +1976,18 @@ print(f"\nSaved {RESULTS_DIR / 'sim_summary.csv'}")
 
 # %%
 tx_cols = ["tx_data_seg_per_reading", "tx_relay_seg_per_reading", "tx_ack_per_reading",
-           "tx_relay_ack_per_reading", "tx_total_per_reading", "collisions_relay_dcu", "collisions_relay_dcu_new_per_reading", "collisions_nonrelay",
+           "tx_relay_ack_per_reading", "tx_total_per_reading", "collisions_relay_dcu",
+           "collisions_relay_dcu_new_per_reading", "collisions_nonrelay",
            "halfduplex_losses", "frac_readings_retx", "sender_ack_ratio"]
 print(summary[["site", "method", "interval_min"] + tx_cols].round(3).to_string(index=False))
 
 # %% [markdown]
 # ### LaTeX table
 #
-# One `tabular` per reporting interval, in the layout of the paper's table (mean ± 95 % CI).
-# "Collisions" is the column named by `LATEX_COLLISION_METRIC` (default: receptions lost to overlap
-# at relays and DCUs, per reading); "Latency" is the mean latency of delivered readings.
+# One `tabular` per reporting interval, in the layout of the paper's table (mean ± 95 % CI), written
+# to each site's folder. "Collisions" is the column named by `LATEX_COLLISION_METRIC` (default:
+# receptions lost to overlap at relays and DCUs, per reading); "Latency" is the mean latency of
+# delivered readings.
 
 # %%
 def latex_escape(text: str) -> str:
@@ -1982,28 +2017,27 @@ def latex_table(summary: pd.DataFrame, interval: float) -> str:
     return "\n".join(lines)
 
 
-latex = "\n\n".join(latex_table(summary, iv) for iv in INTERVALS)
-(RESULTS_DIR / "sim_table.tex").write_text(latex + "\n")
-print(latex)
+for site, g in summary.groupby("site", sort=False):
+    latex = "\n\n".join(latex_table(g, iv) for iv in INTERVALS)
+    (site_dir(site) / "sim_table.tex").write_text(latex + "\n")
+    print(latex)
+    print(f"Saved {site_dir(site) / 'sim_table.tex'}\n")
 
 # %% [markdown]
 # ### Plots
 #
-# Colours identify methods consistently in every figure; error bars are 95 % confidence intervals.
+# One set of figures per site, in `<site>/figures/`. Colours identify methods consistently in every
+# figure; error bars are 95 % confidence intervals.
 
 # %%
-FIG_DIR = RESULTS_DIR / "figures"
-FIG_DIR.mkdir(parents=True, exist_ok=True)
 METHOD_COLORS = dict(zip(METHODS, ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4"]))
 METHOD_MARKERS = dict(zip(METHODS, ["o", "s", "^", "D", "v"]))
 plt.rcParams.update({"axes.spines.top": False, "axes.spines.right": False, "axes.grid": True,
                      "grid.color": "0.9", "grid.linewidth": 0.6, "axes.axisbelow": True})
 
-sites = list(summary["site"].unique())
-fig, axes = plt.subplots(1, len(sites), figsize=(5.5 * len(sites), 4.2), squeeze=False)
 width = 0.8 / len(METHODS)
-for ax, site in zip(axes[0], sites):
-    s = summary[summary.site == site]
+for site, s in summary.groupby("site", sort=False):
+    fig, ax = plt.subplots(figsize=(6, 4.4))
     for k, m in enumerate(METHODS):
         g = s[s.method == m].set_index("interval_min").reindex(INTERVALS)
         x = np.arange(len(INTERVALS)) + (k - (len(METHODS) - 1) / 2) * width
@@ -2013,39 +2047,36 @@ for ax, site in zip(axes[0], sites):
             ax.annotate(f"{v:.1f}", (b.get_x() + b.get_width() / 2, v), xytext=(0, 3),
                         textcoords="offset points", ha="center", va="bottom", fontsize=8, color="0.2")
     ax.set_xticks(np.arange(len(INTERVALS)), [f"{iv:g} min" for iv in INTERVALS])
-    lo = max(0.0, 100 * np.nanmin(s["pdr"] - s["pdr_ci95"]) - 5)
-    ax.set_ylim(lo, 101)
+    ax.set_ylim(max(0.0, 100 * np.nanmin(s["pdr"] - s["pdr_ci95"]) - 5), 101)
     ax.set_ylabel("PDR (%)")
-    ax.set_title(f"Site {site}")
-handles, labels = axes[0][0].get_legend_handles_labels()
-fig.legend(handles, labels, loc="lower center", ncol=len(METHODS), frameon=False)
-fig.suptitle(f"Packet delivery ratio by method ({OFFSET_MODE} offsets, {COLLISION_MODEL})")
-fig.tight_layout(rect=(0, 0.08, 1, 1))
-fig.savefig(FIG_DIR / "pdr_by_method.png", dpi=FIG_DPI)
-plt.show()
+    handles, labels = ax.get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=len(METHODS), frameon=False)
+    fig.suptitle(f"Site {site}: packet delivery ratio by method ({OFFSET_MODE} offsets, {COLLISION_MODEL})")
+    fig.tight_layout(rect=(0, 0.08, 1, 1))
+    fig.savefig(site_dir(site) / "figures" / "pdr_by_method.png", dpi=FIG_DPI)
+    plt.show()
 
 # %%
 if len(INTERVALS) > 1:
-    fig, axes = plt.subplots(2, len(sites), figsize=(5.5 * len(sites), 7.5), squeeze=False, sharex=True)
-    for j, site in enumerate(sites):
-        s = summary[summary.site == site]
+    for site, s in summary.groupby("site", sort=False):
+        fig, axes = plt.subplots(2, 1, figsize=(6, 7.5), sharex=True)
         for m in METHODS:
             g = s[s.method == m].sort_values("interval_min")
             kw = dict(color=METHOD_COLORS[m], marker=METHOD_MARKERS[m], lw=2, ms=7, capsize=3, label=m)
-            axes[0][j].errorbar(g["interval_min"], 100 * g["pdr"], yerr=100 * g["pdr_ci95"], **kw)
-            axes[1][j].errorbar(g["interval_min"], g["latency_mean_ms"], yerr=g["latency_mean_ms_ci95"], **kw)
-        axes[0][j].set_title(f"Site {site}")
-        axes[1][j].set_xlabel("Reporting interval (min, log scale)")
-        for ax in axes[:, j]:
+            axes[0].errorbar(g["interval_min"], 100 * g["pdr"], yerr=100 * g["pdr_ci95"], **kw)
+            axes[1].errorbar(g["interval_min"], g["latency_mean_ms"], yerr=g["latency_mean_ms_ci95"], **kw)
+        for ax in axes:
             ax.set_xscale("log")
             ax.set_xticks(INTERVALS, [f"{iv:g}" for iv in INTERVALS])
             ax.minorticks_off()
-    axes[0][0].set_ylabel("PDR (%)")
-    axes[1][0].set_ylabel("Mean latency (ms)")
-    axes[0][0].legend(frameon=False)
-    fig.tight_layout()
-    fig.savefig(FIG_DIR / "pdr_latency_vs_interval.png", dpi=FIG_DPI)
-    plt.show()
+        axes[0].set_title(f"Site {site}")
+        axes[0].set_ylabel("PDR (%)")
+        axes[1].set_ylabel("Mean latency (ms)")
+        axes[1].set_xlabel("Reporting interval (min, log scale)")
+        axes[0].legend(frameon=False)
+        fig.tight_layout()
+        fig.savefig(site_dir(site) / "figures" / "pdr_latency_vs_interval.png", dpi=FIG_DPI)
+        plt.show()
 else:
     print("Single reporting interval: PDR/latency-vs-interval plot skipped (set INTERVALS_MIN to sweep).")
 
@@ -2060,8 +2091,9 @@ else:
 per_meter = (per_meter_runs.groupby(["site", "method", "interval_min", "meter_id"], sort=False)
              [["n_readings", "n_delivered"]].sum().reset_index())
 per_meter["pdr"] = per_meter["n_delivered"] / per_meter["n_readings"]
-per_meter.to_csv(RESULTS_DIR / "sim_per_meter.csv", index=False)
-print(f"Saved {RESULTS_DIR / 'sim_per_meter.csv'}")
+for site, g in per_meter.groupby("site", sort=False):
+    g.to_csv(site_dir(site) / "sim_per_meter.csv", index=False)
+    print(f"Saved {site_dir(site) / 'sim_per_meter.csv'}")
 
 cmap = plt.get_cmap("Reds_r")
 for su in UNIVERSES:
@@ -2103,7 +2135,8 @@ for su in UNIVERSES:
                    Line2D([], [], c="0.75", label="planned parent link")]
         fig.legend(handles=handles, loc="lower center", ncol=5, frameon=False)
         fig.suptitle(f"Site {sp.name}: per-meter PDR, {interval:g} min interval ({N_RUNS} runs)")
-        fig.savefig(FIG_DIR / f"{sp.name}_per_meter_pdr_{interval:g}min.png", dpi=FIG_DPI, bbox_inches="tight")
+        fig.savefig(site_dir(sp.name) / "figures" / f"per_meter_pdr_{interval:g}min.png", dpi=FIG_DPI,
+                    bbox_inches="tight")
         plt.show()
 
 # %%
