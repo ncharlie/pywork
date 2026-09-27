@@ -4,7 +4,8 @@
 data concentrator unit (DCU) pole and the set of relay meters for a Bluetooth Mesh smart
 metering network. The proposed method is a single MILP (solved with HiGHS) that minimises
 redundant rebroadcasts under managed flooding and uses hop count only to break ties. It is
-compared with the minimum-hop site baseline, an all-relay baseline and an ablation.
+compared with two baselines at the minimum-hop site: **Min-hop + min-relay** (the same MILP with
+the site fixed and every relay weighted 1) and **All-relay** (every meter relays).
 
 ## Usage
 
@@ -24,9 +25,9 @@ To try the notebook without data, set `GENERATE_DEMO_SITE = True`.
 | File | Content |
 |---|---|
 | `planning_summary.csv` | Per site and method: DCUs, relays, redundant rebroadcasts, tree and flooding hops, solve time, MILP status and gap |
-| `unit_site_comparison.csv` | Per planning unit: proposed pole vs minimum-hop pole and the distance between them |
+| `unit_site_comparison.csv` | Per planning unit: Proposed pole vs minimum-hop pole and their distance, and whether Proposed and Min-hop + min-relay select the same relays |
 | `planning_summary.tex` | LaTeX `tabular` of the summary |
-| `<site>_plans.png` | Minimum-hop plan next to the proposed plan |
+| `<site>_plans.png` | Min-hop + min-relay plan next to the Proposed plan |
 | `<site>_plans.json` | Parameters, local coordinates, planning units and each method's plan (DCU, relays, parents, TTL per meter), read by the simulation notebook |
 
 ## Source

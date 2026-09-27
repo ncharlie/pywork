@@ -23,13 +23,17 @@
 # rebroadcasts**, using the hop count only to break ties. It is compared with the site criterion
 # of routing-based networks, which picks the **minimum-hop** site.
 #
+# Three methods are compared: **Proposed** (the MILP chooses the site and the relays),
+# **Min-hop + min-relay** (minimum-hop site, fewest relays) and **All-relay** (minimum-hop site,
+# every meter relays).
+#
 # | Part | Content |
 # |---|---|
 # | Configuration | All parameters in one cell |
 # | 0 | Setup: packages, versions, HiGHS API detection |
 # | 1 | Data preparation: cleaning, UTM projection, link budget, adjacency, groups, planning units, hop distances |
 # | 2 | Proposed method: a single MILP (formulation, solver, independent verifier, brute-force check) |
-# | 3 | Baselines (minimum-hop, all-relay) and ablation (proposed relays at the minimum-hop site) |
+# | 3 | Baselines: Min-hop + min-relay and All-relay |
 # | Summary | Tables, CSV, LaTeX, and plan plots |
 # | 4 | JSON export for the simulation notebook |
 #
@@ -65,7 +69,7 @@ PATH_LOSS_EXP = 3.5                 # log-distance path-loss exponent n
 D0_M = 1.0                          # reference distance d0 (m)
 FREQ_HZ = 2.44e9                    # carrier frequency (Hz); PL(d0) is free-space loss at d0
 SHADOWING_SIGMA_DB = 6.0            # log-normal shadowing sigma; not used here, exported for simulation
-D_MAX_OVERRIDE_M: float | None = 90.0  # used instead of the computed d_max if not None
+D_MAX_OVERRIDE_M: float | None = None  # used instead of the computed d_max if not None
 
 # --- MILP (HiGHS) ---------------------------------------------------------------
 TIME_LIMIT_S = 600.0                # per MILP solve
@@ -375,9 +379,9 @@ def project_to_local(meters: pd.DataFrame, poles: pd.DataFrame) -> tuple[np.ndar
 # $$d_\text{max} = d_0 \cdot 10^{\left(P_\text{EIRP} - P_\text{sens} - M - \mathrm{PL}(d_0)\right)/(10\,n)} .$$
 #
 # The reference loss is the free-space path loss at $d_0$:
-# $\mathrm{PL}(d_0) = 20 \log_{10}\!\left(4\pi d_0 f / c\right) \approx 40.2$ dB at 2.44 GHz and 1 m.
-# With $\mathrm{PL}(d_0)$ rounded to 40 dB the formula gives 90.6 m, which the paper rounds down
-# to $d_\text{max} = 90$ m (`D_MAX_OVERRIDE_M`). The unrounded value is printed for reference.
+# $\mathrm{PL}(d_0) = 20 \log_{10}\!\left(4\pi d_0 f / c\right) \approx 40.2$ dB at 2.44 GHz and 1 m,
+# which gives $d_\text{max} \approx 89.4$ m. This computed value is used
+# (`D_MAX_OVERRIDE_M = None`); setting `D_MAX_OVERRIDE_M` replaces it.
 # Shadowing ($\sigma$ = `SHADOWING_SIGMA_DB`) is covered by the fade margin here and is only
 # used by the simulation.
 
@@ -795,6 +799,11 @@ for site in sites.values():
 # an integer, so any decrease of it by one outweighs every possible change of the hop term:
 # the MILP minimises $R$ first and uses the hops only to break ties.
 #
+# **Relay weight.** The same model is also solved with every relay weighted 1,
+# $\min \sum_j r_j + \varepsilon \sum_i h_i$ (`relay_weight="unit"`, used by the
+# Min-hop + min-relay baseline with $y$ fixed). Only the objective coefficients of $r_j$ change;
+# the same argument shows that the relay count is minimised first and the hops break ties.
+#
 # **Constraints**
 #
 # $$\begin{aligned}
@@ -813,9 +822,10 @@ for site in sites.values():
 # $h_i \le H \le \text{TTL}_\text{max}$ ensures every planned path is deliverable with a valid TTL.
 #
 # **Optimality of the primary term.** HiGHS reports a lower bound $LB$ on the objective. Because
-# $R$ is an integer and the hop term lies in $(0,1)$, the optimal $R^*$ satisfies
-# $R^* > LB - 1$, i.e. $R^* \ge \lfloor LB \rfloor$. The notebook reports this bound, so a run
-# stopped by the time limit still certifies how far its $R$ can be from optimal.
+# the primary term $P$ ($R$, or the relay count with unit weights) is an integer and the hop term
+# lies in $(0,1)$, the optimal $P^*$ satisfies $P^* > LB - 1$, i.e. $P^* \ge \lfloor LB \rfloor$.
+# The notebook reports this bound, so a run stopped by the time limit still certifies how far its
+# primary term can be from optimal.
 
 # %% [markdown]
 # ### 2.2 Model construction and solver
@@ -826,9 +836,8 @@ for site in sites.values():
 # when the installed `highspy` has it, and otherwise through the **low-level** interface
 # (`addVars` / `addRows`). Both give the same model; the brute-force check below solves with both.
 #
-# The minimum-hop plan of Part 3 is passed as a **MIP start**. It is built in 2.3 because the
-# solver needs it; Part 3 reuses the same function as the baseline. Before it is passed to
-# HiGHS, the start vector is checked against every row, bound and integrality requirement.
+# HiGHS receives a **MIP start** (see 2.3). Before it is passed to HiGHS, the start vector is
+# checked against every row, bound and integrality requirement.
 
 # %%
 @dataclass
@@ -870,18 +879,32 @@ class MilpModel:
                                        shape=(self.n_rows, self.n_cols))
 
 
-def build_milp(unit: PlanningUnit, fixed_site: int | None = None, ttl_max: int = TTL_MAX) -> MilpModel:
+RELAY_WEIGHTS = ("neighbors", "unit")
+
+
+def relay_costs(unit: PlanningUnit, relay_weight: str) -> np.ndarray:
+    """Objective coefficient of r_j: |A(j)| for 'neighbors', 1 for 'unit'."""
+    if relay_weight == "neighbors":
+        return unit.degree.astype(float)
+    if relay_weight == "unit":
+        return np.ones(unit.N)
+    raise ValueError(f"relay_weight must be one of {RELAY_WEIGHTS}, got '{relay_weight}'")
+
+
+def build_milp(unit: PlanningUnit, fixed_site: int | None = None, relay_weight: str = "neighbors",
+               ttl_max: int = TTL_MAX) -> MilpModel:
     """Encode the formulation of 2.1 for one planning unit.
 
     Args:
         unit: Planning unit.
-        fixed_site: Local candidate index; if given, y is fixed to that pole (ablation).
+        fixed_site: Local candidate index; if given, y is fixed to that pole.
+        relay_weight: 'neighbors' (cost |A(j)| per relay) or 'unit' (cost 1 per relay).
         ttl_max: Maximum TTL; H = min(|N|, ttl_max).
     """
     N, C = unit.N, unit.C
     H = min(N, ttl_max)
     eps = 1.0 / (H * N + 1)
-    deg = unit.degree
+    weights = relay_costs(unit, relay_weight)
     lb, ub, cost, is_int = [], [], [], []
 
     def add_cols(n: int, lo: float, hi: float, c: np.ndarray | float, integer: bool) -> np.ndarray:
@@ -893,7 +916,7 @@ def build_milp(unit: PlanningUnit, fixed_site: int | None = None, ttl_max: int =
         return np.arange(start, start + n)
 
     y = add_cols(C, 0.0, 1.0, 0.0, True)
-    r = add_cols(N, 0.0, 1.0, deg, True)
+    r = add_cols(N, 0.0, 1.0, weights, True)
     x_pairs = [(i, int(j)) for i in range(N) for j in unit.A[i]]
     x = dict(zip(x_pairs, add_cols(len(x_pairs), 0.0, 1.0, 0.0, True).tolist()))
     u_pairs = [(int(i), k) for k in range(C) for i in unit.D[k]]
@@ -989,13 +1012,23 @@ def load_model(h: highspy.Highs, model: MilpModel, api: str) -> None:
         raise AssertionError("HiGHS model size differs from the built model")
 
 # %% [markdown]
-# ### 2.3 Plans, the minimum-hop MIP start, and the solver
+# ### 2.3 Plans, MIP starts, and the solver
 #
 # A **plan** of a unit is a DCU pole, a relay set and one parent per meter (a meter or the DCU).
-# The minimum-hop plan (defined formally in Part 3) builds a shortest-path tree by BFS from the
-# DCU and makes every meter with a child a relay. It satisfies every constraint of 2.1 with
-# $h_i = \delta_{ic}$ (the BFS depth), provided $\max_i \delta_{ic} \le H$, so it is a valid MIP start.
-# For the ablation (`fixed_site`), the same shortest-path tree at the fixed pole is used.
+# Any plan whose parent links form a tree rooted at the DCU, whose meter parents are relays and
+# whose depth is at most $H$ satisfies every constraint of 2.1 with $h_i$ = depth of $i$.
+#
+# * The **all-relay plan** at pole $c$ (defined formally in Part 3) is the shortest-path BFS tree
+#   with every meter relaying; $h_i = \delta_{ic}$, valid when $\max_i \delta_{ic} \le H$.
+#   It is the MIP start of **Min-hop + min-relay** (at its fixed pole), and the default MIP start
+#   of `solve_milp` when none is given.
+# * The **Min-hop + min-relay** solution is the MIP start of **Proposed**: it uses the same
+#   constraints with $y$ fixed to one candidate pole, so it is feasible for the Proposed model.
+#
+# `solve_milp(unit, fixed_site=None, relay_weight="neighbors")` solves the model;
+# `relay_weight` is `"neighbors"` (coefficient $|A(j)|$, Proposed) or `"unit"` (coefficient 1,
+# Min-hop + min-relay), and `fixed_site` fixes $y$ to one pole. The keyword `mip_start` passes
+# the start plan.
 
 # %%
 @dataclass
@@ -1030,6 +1063,11 @@ class Plan:
     fallback: bool = False
 
 
+PROPOSED = "Proposed"
+MIN_RELAY = "Min-hop + min-relay"
+ALL_RELAY = "All-relay"
+
+
 def shortest_path_tree(unit: PlanningUnit, k: int) -> tuple[np.ndarray, float]:
     """BFS shortest-path tree towards a DCU at candidate ``k``.
 
@@ -1053,15 +1091,6 @@ def shortest_path_tree(unit: PlanningUnit, k: int) -> tuple[np.ndarray, float]:
     return parent, total
 
 
-def tree_plan(unit: PlanningUnit, k: int, method: str) -> Plan:
-    """Shortest-path-tree plan at candidate ``k``; relays are the meters with at least one child."""
-    t0 = time.perf_counter()
-    parent, _ = shortest_path_tree(unit, k)
-    relays = np.zeros(unit.N, dtype=bool)
-    relays[parent[parent >= 0]] = True
-    return Plan(method, unit.uid, k, relays, parent, solve_time_s=time.perf_counter() - t0)
-
-
 def min_hop_site(unit: PlanningUnit) -> tuple[int, pd.DataFrame]:
     """Minimum-hop site: smallest mean delta, ties by total tree link length, then pole index.
 
@@ -1077,13 +1106,17 @@ def min_hop_site(unit: PlanningUnit) -> tuple[int, pd.DataFrame]:
     return int(table["k"].iloc[0]), table
 
 
-def min_hop_plan(unit: PlanningUnit) -> Plan:
-    """Baseline of Tanakornpintong and Pirak (2021): minimum-hop site with its shortest-path tree."""
+def all_relay_plan(unit: PlanningUnit, k: int | None = None) -> Plan:
+    """All-relay plan: shortest-path BFS tree at candidate ``k`` with every meter relaying.
+
+    ``k`` defaults to the minimum-hop pole (the All-relay baseline of Part 3).
+    """
     t0 = time.perf_counter()
-    k, _ = min_hop_site(unit)
-    plan = tree_plan(unit, k, "minimum-hop")
-    plan.solve_time_s = time.perf_counter() - t0
-    return plan
+    if k is None:
+        k, _ = min_hop_site(unit)
+    parent, _ = shortest_path_tree(unit, k)
+    return Plan(ALL_RELAY, unit.uid, k, np.ones(unit.N, dtype=bool), parent,
+                solve_time_s=time.perf_counter() - t0)
 
 
 def plan_to_vector(model: MilpModel, unit: PlanningUnit, plan: Plan) -> np.ndarray:
@@ -1118,26 +1151,31 @@ def tree_depths(parent: np.ndarray) -> np.ndarray:
     return depth
 
 
-def solve_milp(unit: PlanningUnit, fixed_site: int | None = None, *, api: str = "auto",
+def solve_milp(unit: PlanningUnit, fixed_site: int | None = None, relay_weight: str = "neighbors", *,
+               mip_start: Plan | None = None, api: str = "auto",
                time_limit_s: float = TIME_LIMIT_S, method: str | None = None) -> Plan:
     """Solve the MILP of 2.1 for one planning unit with HiGHS.
 
     Args:
         unit: Planning unit.
-        fixed_site: Local candidate index to fix the DCU to (ablation), or None to optimise it.
+        fixed_site: Local candidate index to fix the DCU to, or None to optimise it.
+        relay_weight: 'neighbors' (cost |A(j)| per relay, Proposed) or 'unit' (cost 1 per relay,
+            Min-hop + min-relay).
+        mip_start: Plan passed to HiGHS as MIP start; default: the all-relay plan at
+            ``fixed_site`` (or at the minimum-hop pole if the site is free).
         api: 'auto' (modelling interface if available), 'modeling' or 'low-level'.
         time_limit_s: HiGHS time limit.
-        method: Name stored in the plan (default 'proposed' or 'ablation').
+        method: Name stored in the plan (default 'Proposed' or 'Min-hop + min-relay' by weight).
 
     Returns:
         The extracted plan, including status, objective, best bound, gap and solve time.
     """
     if api == "auto":
         api = "modeling" if HAS_MODELING_API else "low-level"
-    method = method or ("proposed" if fixed_site is None else "ablation")
-    model = build_milp(unit, fixed_site)
+    method = method or {"neighbors": PROPOSED, "unit": MIN_RELAY}[relay_weight]
+    model = build_milp(unit, fixed_site, relay_weight)
 
-    start = min_hop_plan(unit) if fixed_site is None else tree_plan(unit, fixed_site, "minimum-hop tree")
+    start = mip_start if mip_start is not None else all_relay_plan(unit, fixed_site)
     start_vec = plan_to_vector(model, unit, start)
     start_problems = check_point_feasible(model, start_vec)
 
@@ -1154,7 +1192,7 @@ def solve_milp(unit: PlanningUnit, fixed_site: int | None = None, *, api: str = 
         sol.value_valid = True
         h.setSolution(sol)
     else:
-        print(f"    WARNING: MIP start infeasible ({start_problems}); solving without it")
+        print(f"    WARNING: MIP start '{start.method}' infeasible ({start_problems}); solving without it")
 
     t0 = time.perf_counter()
     h.run()
@@ -1265,10 +1303,14 @@ def verify_plan(unit: PlanningUnit, plan: Plan, ttl_max: int = TTL_MAX) -> dict:
     }
 
 
-def plan_objective(unit: PlanningUnit, ev: dict, ttl_max: int = TTL_MAX) -> float:
-    """MILP objective value of a verified plan: R + eps * sum(tree hops)."""
+def plan_objective(unit: PlanningUnit, ev: dict, relay_weight: str = "neighbors", ttl_max: int = TTL_MAX) -> float:
+    """MILP objective value of a verified plan: primary term + eps * sum(tree hops).
+
+    The primary term is R (``relay_weight='neighbors'``) or the relay count (``'unit'``).
+    """
     H = min(unit.N, ttl_max)
-    return ev["redundant"] + ev["tree_hops"].sum() / (H * unit.N + 1)
+    primary = ev["redundant"] if relay_weight == "neighbors" else ev["relays"]
+    return primary + ev["tree_hops"].sum() / (H * unit.N + 1)
 
 # %% [markdown]
 # ### 2.5 Brute-force check on small instances
@@ -1279,28 +1321,31 @@ def plan_objective(unit: PlanningUnit, ev: dict, ttl_max: int = TTL_MAX) -> floa
 # hop count for $(c, \mathcal{R})$ is the sum of flooding hops (a BFS tree through relays
 # attains it; $h_i \le H$ holds since a shortest path visits at most $|N|$ meters). So
 #
-# $$\text{OPT} = \min_{c,\ \mathcal{R}\ \text{feasible}} \Big( \sum_{j \in \mathcal{R}} |A(j)|
-#   + \varepsilon \sum_i \text{hops}_{c,\mathcal{R}}(i) \Big).$$
+# $$\text{OPT} = \min_{c,\ \mathcal{R}\ \text{feasible}} \Big( \sum_{j \in \mathcal{R}} w_j
+#   + \varepsilon \sum_i \text{hops}_{c,\mathcal{R}}(i) \Big),$$
 #
-# The MILP (with both HiGHS interfaces, free and fixed site) must reach the same value.
+# with relay weight $w_j = |A(j)|$ (`"neighbors"`) or $w_j = 1$ (`"unit"`). For **both** weights,
+# the MILP (with both HiGHS interfaces, free site and site fixed to the minimum-hop pole) must
+# reach the same value.
 # Two kinds of instances are checked: four small sparse synthetic sites, and a connected
 # sub-network of up to `BRUTE_FORCE_MAX_METERS` meters cut from the largest planning unit of the
 # first real site (with the poles in range of its first meter as candidates).
 
 # %%
-def brute_force_optimum(unit: PlanningUnit, fixed_site: int | None = None, ttl_max: int = TTL_MAX) -> tuple[float, int, np.ndarray]:
+def brute_force_optimum(unit: PlanningUnit, fixed_site: int | None = None, relay_weight: str = "neighbors",
+                        ttl_max: int = TTL_MAX) -> tuple[float, int, np.ndarray]:
     """Exhaustive search over sites and relay subsets; returns (objective, site, relay mask)."""
     N = unit.N
     if N > 20:
         raise ValueError("brute force is limited to 20 meters")
     H = min(N, ttl_max)
     eps = 1.0 / (H * N + 1)
-    deg = unit.degree
+    weights = relay_costs(unit, relay_weight)
     best = (math.inf, -1, np.zeros(N, dtype=bool))
     sites_ = range(unit.C) if fixed_site is None else [fixed_site]
     for mask in range(2 ** N):
         relays = np.array([(mask >> j) & 1 for j in range(N)], dtype=bool)
-        primary = deg[relays].sum()
+        primary = weights[relays].sum()
         if primary > best[0]:
             continue
         for k in sites_:
@@ -1355,26 +1400,28 @@ def site_from_frames(name: str, meters: pd.DataFrame, poles: pd.DataFrame, d_max
 
 
 def brute_force_check(unit: PlanningUnit, label: str) -> None:
-    """Compare MILP optima (both APIs, free and fixed site) with exhaustive search."""
+    """Compare MILP optima (both relay weights, both APIs, free and fixed site) with exhaustive search."""
     print(f"\nBrute-force check '{label}': {unit.N} meters, {unit.C} candidates, "
           f"{2 ** unit.N} relay subsets")
-    bf_obj, bf_k, bf_relays = brute_force_optimum(unit)
-    print(f"  exhaustive search: objective {bf_obj:.6f} (R = {int(unit.degree[bf_relays].sum())}), "
-          f"site {bf_k}, relays {np.flatnonzero(bf_relays).tolist()}")
     apis = ["low-level"] + (["modeling"] if HAS_MODELING_API else [])
     k_fix = min_hop_site(unit)[0]
-    bf_fix = brute_force_optimum(unit, fixed_site=k_fix)[0]
-    for api in apis:
-        for fixed, target in ((None, bf_obj), (k_fix, bf_fix)):
-            plan = solve_milp(unit, fixed_site=fixed, api=api)
-            ev = verify_plan(unit, plan)
-            obj_plan = plan_objective(unit, ev)
-            ok = (abs(plan.objective - target) < 1e-6 and abs(obj_plan - target) < 1e-6
-                  and plan.status == "Optimal")
-            print(f"  MILP [{api:<9} site={'free' if fixed is None else f'fixed {fixed}'}]: "
-                  f"HiGHS objective {plan.objective:.6f}, verified plan objective {obj_plan:.6f}, "
-                  f"target {target:.6f}, status {plan.status} -> {'OK' if ok else 'MISMATCH'}")
-            assert ok, "MILP does not match the exhaustive search"
+    for weight in RELAY_WEIGHTS:
+        bf_obj, bf_k, bf_relays = brute_force_optimum(unit, relay_weight=weight)
+        bf_fix = brute_force_optimum(unit, fixed_site=k_fix, relay_weight=weight)[0]
+        print(f"  [{weight}] exhaustive search: objective {bf_obj:.6f} (R = {int(unit.degree[bf_relays].sum())}, "
+              f"{int(bf_relays.sum())} relays), site {bf_k}, relays {np.flatnonzero(bf_relays).tolist()}; "
+              f"at site {k_fix}: {bf_fix:.6f}")
+        for api in apis:
+            for fixed, target in ((None, bf_obj), (k_fix, bf_fix)):
+                plan = solve_milp(unit, fixed_site=fixed, relay_weight=weight, api=api)
+                ev = verify_plan(unit, plan)
+                obj_plan = plan_objective(unit, ev, weight)
+                ok = (abs(plan.objective - target) < 1e-6 and abs(obj_plan - target) < 1e-6
+                      and plan.status == "Optimal")
+                print(f"  MILP [{weight:<9} {api:<9} site={'free' if fixed is None else f'fixed {fixed}'}]: "
+                      f"HiGHS objective {plan.objective:.6f}, verified plan objective {obj_plan:.6f}, "
+                      f"target {target:.6f}, status {plan.status} -> {'OK' if ok else 'MISMATCH'}")
+                assert ok, "MILP does not match the exhaustive search"
 
 
 for seed_offset in range(1, 5):  # several sparse synthetic layouts
@@ -1394,42 +1441,45 @@ if first_site.units:
 print("\nAll brute-force checks passed.")
 
 # %% [markdown]
-# ## Part 3 — Baselines and ablation
+# ## Part 3 — Baselines
 #
-# ### 3.1 Minimum-hop placement (Tanakornpintong and Pirak, 2021)
+# ### 3.1 Minimum-hop site (Tanakornpintong and Pirak, 2021)
 #
 # The site criterion of routing-based networks: for each candidate pole $c$ compute the mean
 # all-relay hop count $\bar\delta_c = \frac{1}{|N|}\sum_i \delta_{ic}$ and choose the smallest.
 # Ties are broken by the smallest total link length of the shortest-path tree, then by pole
-# index. The tree is built by BFS from the DCU: each meter's parent is its nearest neighbour in
-# the previous BFS layer (or the DCU itself for layer 1). Relays are the meters with at least one
-# child (`min_hop_plan`, defined in 2.3).
+# index (`min_hop_site`, defined in 2.3). The tree is built by BFS from the DCU: each meter's
+# parent is its nearest neighbour in the previous BFS layer (or the DCU itself for layer 1).
 #
 # > The original work also applies throughput and delay thresholds derived from an IEEE
 # > 802.15.4g queuing model. Those thresholds belong to a different MAC/PHY and a routing-based
 # > network, so they are **not** used here; only the minimum-hop site criterion is adopted.
 #
-# ### 3.2 All-relay
+# ### 3.2 Min-hop + min-relay
 #
-# The same pole and tree as the minimum-hop baseline, but every meter relays (the Bluetooth Mesh
-# default when the relay feature is enabled on all nodes).
+# The minimum-hop site, with the fewest relays: the MILP of 2.1 with $y$ fixed to the
+# minimum-hop pole and every relay weighted 1,
+# $\min \sum_j r_j + \varepsilon \sum_i h_i$
+# (`solve_milp(unit, fixed_site=<minimum-hop pole>, relay_weight="unit")`). Its MIP start is the
+# all-relay BFS tree at that pole.
 #
-# ### 3.3 Ablation
+# ### 3.3 All-relay
 #
-# `solve_milp(unit, fixed_site=<minimum-hop pole>)`: the proposed relay selection at the baseline's
-# site. It separates the gain of relay selection from the gain of site selection.
+# The minimum-hop pole and its shortest-path BFS tree, with every meter relaying (the Bluetooth
+# Mesh default when the relay feature is enabled on all nodes). No solver is needed
+# (`all_relay_plan`, defined in 2.3).
 #
-# All methods are scored with the same quantities as the MILP objective (redundant rebroadcasts
-# and hops) and checked by `verify_plan`.
+# ### 3.4 Proposed
+#
+# The MILP of 2.1 with the site chosen by the model and relays weighted $|A(j)|$
+# (`solve_milp(unit)`), with the Min-hop + min-relay solution as MIP start.
+#
+# All methods are scored with the same quantities, whatever they optimise: relays, redundant
+# rebroadcasts $R = \sum_j |A(j)|\, r_j$, and tree and flooding hops. All are checked by
+# `verify_plan`.
 
 # %%
-def all_relay_plan(base: Plan) -> Plan:
-    """Minimum-hop pole and tree with every meter relaying."""
-    return Plan("all-relay", base.uid, base.site_k, np.ones_like(base.relays), base.parent.copy(),
-                solve_time_s=base.solve_time_s)
-
-
-METHODS = ("minimum-hop", "all-relay", "proposed", "ablation")
+METHODS = (PROPOSED, MIN_RELAY, ALL_RELAY)
 # results[site][method] = list of (plan, evaluation) per unit
 results: dict[str, dict[str, list[tuple[Plan, dict]]]] = {}
 
@@ -1438,36 +1488,40 @@ for site in sites.values():
     results[site.name] = {m: [] for m in METHODS}
     for unit in site.units:
         t_unit = time.perf_counter()
-        base = min_hop_plan(unit)
-        plans = {
-            "minimum-hop": base,
-            "all-relay": all_relay_plan(base),
-            "proposed": solve_milp(unit),
-            "ablation": solve_milp(unit, fixed_site=base.site_k),
-        }
+        k_mh, _ = min_hop_site(unit)
+        all_relay = all_relay_plan(unit, k_mh)
+        min_relay = solve_milp(unit, fixed_site=k_mh, relay_weight="unit", mip_start=all_relay)
+        proposed = solve_milp(unit, relay_weight="neighbors", mip_start=min_relay)
+        plans = {PROPOSED: proposed, MIN_RELAY: min_relay, ALL_RELAY: all_relay}
         for m, plan in plans.items():
             results[site.name][m].append((plan, verify_plan(unit, plan)))
         ev = {m: results[site.name][m][-1][1] for m in METHODS}
-        p = plans["proposed"]
         print(f"  unit {unit.uid + 1}/{len(site.units)}: N={unit.N}, C={unit.C} | "
-              f"R min-hop {ev['minimum-hop']['redundant']}, all-relay {ev['all-relay']['redundant']}, "
-              f"ablation {ev['ablation']['redundant']}, proposed {ev['proposed']['redundant']} "
-              f"(>= {p.primary_lb:g}) | proposed {p.status}, gap {p.gap:.2e}, {p.solve_time_s:.1f}s | "
-              f"unit total {time.perf_counter() - t_unit:.1f}s")
+              f"R: {PROPOSED} {ev[PROPOSED]['redundant']}, {MIN_RELAY} {ev[MIN_RELAY]['redundant']}, "
+              f"{ALL_RELAY} {ev[ALL_RELAY]['redundant']} | "
+              f"{MIN_RELAY}: {min_relay.status}, relays {ev[MIN_RELAY]['relays']} (>= {min_relay.primary_lb:g}), "
+              f"gap {min_relay.gap:.2e}, {min_relay.solve_time_s:.1f}s | "
+              f"{PROPOSED}: {proposed.status}, R >= {proposed.primary_lb:g}, gap {proposed.gap:.2e}, "
+              f"{proposed.solve_time_s:.1f}s | unit total {time.perf_counter() - t_unit:.1f}s")
 
 # %% [markdown]
 # ## Summary
 #
 # Per site and method the metrics are aggregated over the site's planning units: DCUs (one per
 # unit), relays, redundant rebroadcasts $R$, mean and max tree and flooding hops (over all planned
-# meters), total solve time, MILP statuses and the largest MIP gap. `R lower bound` is
-# $\sum_\text{units} \lfloor LB \rfloor$ (see 2.1): if it equals $R$, the proposed relay sets are
-# proven optimal in redundant rebroadcasts.
+# meters), total solve time (HiGHS time; none for All-relay), MILP statuses and the largest MIP
+# gap. `primary lower bound` is $\sum_\text{units} \lfloor LB \rfloor$ (see 2.1): a lower bound on
+# $R$ for Proposed and on the relay count for Min-hop + min-relay. If it equals the achieved
+# value, the primary term is proven optimal.
+#
+# The per-unit tables give every MILP solve as HiGHS reported it (status, objective, best bound,
+# gap), the Proposed pole versus the minimum-hop pole, and whether Proposed and
+# Min-hop + min-relay select the same relay set.
 
 # %%
-def summarize(sites: dict[str, Site], results: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Aggregate per (site, method) and per unit (site comparison)."""
-    rows, unit_rows = [], []
+def summarize(sites: dict[str, Site], results: dict) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Aggregate per (site, method), per unit (Proposed vs Min-hop + min-relay), and per MILP solve."""
+    rows, unit_rows, solve_rows = [], [], []
     for name, site in sites.items():
         for m in METHODS:
             pairs = results[name][m]
@@ -1475,22 +1529,31 @@ def summarize(sites: dict[str, Site], results: dict) -> tuple[pd.DataFrame, pd.D
                 continue
             tree = np.concatenate([ev["tree_hops"] for _, ev in pairs])
             flood = np.concatenate([ev["flooding_hops"] for _, ev in pairs])
-            milp = m in ("proposed", "ablation")
+            milp = m != ALL_RELAY
             statuses = collections.Counter(p.status for p, _ in pairs)
             rows.append({
                 "site": name, "meters": len(site.meters), "planned meters": len(tree), "method": m,
                 "DCUs": len(pairs),
                 "relays": sum(ev["relays"] for _, ev in pairs),
                 "redundant rebroadcasts": sum(ev["redundant"] for _, ev in pairs),
-                "R lower bound": sum(p.primary_lb for p, _ in pairs) if milp else np.nan,
+                "primary lower bound": sum(p.primary_lb for p, _ in pairs) if milp else np.nan,
                 "mean tree hops": tree.mean(), "max tree hops": int(tree.max()),
                 "mean flooding hops": flood.mean(), "max flooding hops": int(flood.max()),
-                "solve time (s)": sum(p.solve_time_s for p, _ in pairs),
+                "solve time (s)": sum(p.solve_time_s for p, _ in pairs) if milp else np.nan,
                 "MILP status": ", ".join(f"{s} x{c}" for s, c in statuses.items()) if milp else "-",
                 "max MIP gap": max(p.gap for p, _ in pairs) if milp else np.nan,
                 "fallbacks": sum(p.fallback for p, _ in pairs) if milp else 0,
             })
-        for (pm, _), (pp, pr_ev) in zip(results[name]["minimum-hop"], results[name]["proposed"]):
+            if milp:
+                for p, ev in pairs:
+                    solve_rows.append({
+                        "site": name, "unit": p.uid, "method": m, "status": p.status,
+                        "objective": p.objective, "best bound": p.best_bound, "gap": p.gap,
+                        "primary lower bound": p.primary_lb, "relays": ev["relays"],
+                        "redundant rebroadcasts": ev["redundant"], "solve time (s)": p.solve_time_s,
+                        "fallback": p.fallback,
+                    })
+        for (pp, pr_ev), (pm, _) in zip(results[name][PROPOSED], results[name][MIN_RELAY]):
             unit = site.units[pm.uid]
             c_mh, c_pr = unit.candidates[pm.site_k], unit.candidates[pp.site_k]
             unit_rows.append({
@@ -1501,20 +1564,24 @@ def summarize(sites: dict[str, Site], results: dict) -> tuple[pd.DataFrame, pd.D
                 "pole distance (m)": float(np.linalg.norm(site.pole_xy[c_mh] - site.pole_xy[c_pr])),
                 "mean delta at min-hop pole": unit.delta[:, pm.site_k].mean(),
                 "mean delta at proposed pole": unit.delta[:, pp.site_k].mean(),
+                "same relay set": bool(np.array_equal(pp.relays, pm.relays)),
+                "relays differing": int((pp.relays != pm.relays).sum()),
                 "proposed status": pp.status,
                 "proposed R": pr_ev["redundant"], "proposed R lower bound": pp.primary_lb,
             })
-    return pd.DataFrame(rows), pd.DataFrame(unit_rows)
+    return pd.DataFrame(rows), pd.DataFrame(unit_rows), pd.DataFrame(solve_rows)
 
 
-summary, unit_comparison = summarize(sites, results)
+summary, unit_comparison, milp_solves = summarize(sites, results)
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 summary.to_csv(RESULTS_DIR / "planning_summary.csv", index=False)
 unit_comparison.to_csv(RESULTS_DIR / "unit_site_comparison.csv", index=False)
 
 with pd.option_context("display.max_columns", None, "display.width", 250, "display.float_format", "{:.3f}".format):
     print(summary.to_string(index=False))
-    print("\nProposed vs minimum-hop DCU pole per planning unit:")
+    print("\nMILP solves as reported by HiGHS:")
+    print(milp_solves.to_string(index=False))
+    print(f"\n{PROPOSED} vs {MIN_RELAY} per planning unit (pole and relay set):")
     print(unit_comparison.to_string(index=False))
 print(f"\nSaved {RESULTS_DIR / 'planning_summary.csv'} and {RESULTS_DIR / 'unit_site_comparison.csv'}")
 
@@ -1527,7 +1594,10 @@ def latex_escape(text: str) -> str:
 
 
 def latex_table(summary: pd.DataFrame) -> str:
-    """LaTeX tabular: Site (meters) | Method | DCUs | Relays | Redundant | Mean/max hops | Solve time."""
+    """LaTeX tabular: Site (meters) | Method | DCUs | Relays | Redundant | Mean/max hops | Solve time.
+
+    All-relay needs no solver; its solve time is printed as "--".
+    """
     lines = [r"\begin{tabular}{llrrrcr}", r"\hline",
              r"Site (meters) & Method & DCUs & Relays & Redundant rebroadcasts & Mean / max hops & Solve time (s) \\",
              r"\hline"]
@@ -1536,9 +1606,10 @@ def latex_table(summary: pd.DataFrame) -> str:
             lines.append(r"\hline")
         for j, (_, row) in enumerate(df.iterrows()):
             site_cell = f"{latex_escape(name)} ({row['meters']})" if j == 0 else ""
+            solve = "--" if row["method"] == ALL_RELAY else f"{row['solve time (s)']:.2f}"
             lines.append(f"{site_cell} & {latex_escape(row['method'])} & {row['DCUs']} & {row['relays']} & "
                          f"{row['redundant rebroadcasts']} & {row['mean tree hops']:.2f} / {row['max tree hops']} & "
-                         f"{row['solve time (s)']:.2f} \\\\")
+                         f"{solve} \\\\")
     lines += [r"\hline", r"\end{tabular}"]
     return "\n".join(lines)
 
@@ -1587,7 +1658,7 @@ for site in sites.values():
     if not site.units:
         continue
     fig, axes = plt.subplots(1, 2, figsize=(15, 7), sharex=True, sharey=True)
-    for ax, m in zip(axes, ("minimum-hop", "proposed")):
+    for ax, m in zip(axes, (MIN_RELAY, PROPOSED)):
         plot_plan(site, m, ax)
     axes[0].set_ylabel("y (m)")
     fig.legend(handles=legend, loc="lower center", ncol=5)
