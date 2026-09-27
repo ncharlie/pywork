@@ -39,3 +39,33 @@ diff. Regenerate the notebook after editing it:
 pip install jupytext
 jupytext --to ipynb -o notebooks/dcu_relay_planning.ipynb src/dcu_relay_planning.py
 ```
+
+# Simulation of the plans
+
+`notebooks/mesh_simulation.ipynb` is a discrete-event simulator (plain Python, `heapq`) of Bluetooth
+Mesh over the advertising bearer. It evaluates the plans in `<site>_plans.json`. Each meter sends a
+200-byte reading every interval as 18 SAR segments. The segments are flooded through the planned
+relays and acknowledged by the DCU. All transmissions of a site share the three advertising
+channels, so they can collide. The notebook explains the model and every assumption, runs six
+deterministic validation tests and a reproducibility check before the main runs, and uses common
+random numbers across methods.
+
+## Usage
+
+1. Upload the plan files to `/content/results/<site>_plans.json`.
+2. Edit the configuration cell if needed (for example `SITES`, `INTERVALS_MIN = [15, 5, 1]`, `N_RUNS`,
+   `OFFSET_MODE`, `COLLISION_MODEL`), then choose *Runtime → Run all*.
+
+## Outputs (`results/`)
+
+| File | Content |
+|---|---|
+| `sim_runs.csv` | One row per site, method, interval and run: PDR, segment delivery ratio, latency (mean, median, p95), transmissions per reading by type, collisions, SAR rounds |
+| `sim_summary.csv` | Mean and 95 % confidence interval over runs per site, method and interval |
+| `sim_table.tex` | LaTeX `tabular` (Site, Method, PDR, Collisions, Latency) per interval |
+| `sim_per_meter_runs.csv`, `sim_per_meter.csv` | Per-meter delivered readings, per run and pooled |
+| `sim_metadata.json` | Configuration and package versions |
+| `figures/` | PDR by method, PDR and latency against the interval, per-meter PDR maps (local coordinates) |
+
+`src/mesh_simulation.py` is the jupytext source of the notebook. Regenerate the notebook with
+`jupytext --to ipynb -o notebooks/mesh_simulation.ipynb src/mesh_simulation.py`.
