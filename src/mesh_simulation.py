@@ -10,18 +10,21 @@ whole site share the three advertising channels, so they can collide.
 Three plans are compared per site: Proposed, Min-hop + min-relay and All-relay. The main metric is
 the packet delivery ratio (PDR): the fraction of readings the DCU reassembles completely.
 
-Usage (one site and one reporting interval per call)::
+Usage::
 
-    python mesh_simulation.py /path/to/<site>_plans.json 15
-    python mesh_simulation.py /path/to/<site>_plans.json 5 --runs 100 --workers 16
+    python src/mesh_simulation.py
+    python src/mesh_simulation.py --intervals 15 5 --runs 50 --workers 16
 
-Outputs go to ``/workspace/sim_results/<site>_<interval>/`` (``--out`` to change). The simulations
-(runs x methods) are spread over ``--workers`` processes (default: every CPU). Every simulation
-rebuilds its random draws from its own seeds, so the results do not depend on the number of workers.
+Without arguments it simulates every ``<site>_plans.json`` in ``/workspace/sim_results`` for the
+reporting intervals 1, 5, 10 and 15 min (one job per site and interval), 100 Monte Carlo runs each.
+The outputs of a job go to ``/workspace/sim_results/<site>_<interval>/``, and ``summary_all.csv``
+in the same folder collects the summaries of all jobs. The simulations (runs x methods) are spread
+over ``--workers`` processes (default: every CPU). Every simulation rebuilds its random draws from
+its own seeds, so the results do not depend on the number of workers.
 
-Before the main runs the script runs seven deterministic validation tests, a reproducibility check
-(same seed twice) and a check that the worker pool gives the same results as a single process; it
-stops if any fails.
+Before the main runs of each site the script runs seven deterministic validation tests, and before
+each job a reproducibility check (same seed twice) and a check that the worker pool gives the same
+results as a single process; it stops if any fails.
 
 Sections of this file: configuration; 0 setup and derived constants; 1 model and assumptions;
 2 plan loader; 3 propagation model and random streams; 4 simulator; 5 validation tests; 6 running
@@ -33,12 +36,14 @@ Coordinates in the plan files are local (metres) and confidential, so no plot us
 
 # =============================== CONFIGURATION ===============================
 # Every tunable parameter lives here. The plan file, the reporting interval, the number of runs, the
-# number of worker processes and the output folder are given on the command line.
+# number of worker processes can be changed on the command line.
 # Radio parameters set to None are taken from the "parameters" block of the plan file.
 from pathlib import Path
 
 # --- Input / output -------------------------------------------------------------
-OUTPUT_ROOT = Path("/workspace/sim_results")  # default output: OUTPUT_ROOT/<site>_<interval>/
+PLANS_DIR = Path("/workspace/sim_results")    # default: every <site>_plans.json in this folder
+INTERVALS_MIN = [1, 5, 10, 15]                # default reporting intervals (min), one job each
+OUTPUT_ROOT = Path("/workspace/sim_results")  # outputs: OUTPUT_ROOT/<site>_<interval>/
 METHODS: list[str] = ["Proposed", "Min-hop + min-relay", "All-relay"]  # order used in tables/plots
 
 # --- Traffic ----------------------------------------------------------------------
@@ -209,7 +214,7 @@ def ack_timer_ms(seg_n: int) -> float:
     return min(seg_n + 0.5, SAR_ACK_DELAY_INCREMENT) * SAR_RECEIVER_SEGMENT_INTERVAL_MS
 
 
-def print_setup(interval_min: int, n_runs: int, workers: int) -> None:
+def print_setup(intervals: list[int], n_runs: int, workers: int) -> None:
     """Print the versions, derived constants and SAR timers of this job."""
     print(VERSIONS)
     print(f"PDU airtime                 : ({PHY_OVERHEAD_OCTETS} + {ADV_PDU_OCTETS}) octets x {US_PER_OCTET} us = {AIRTIME_US} us")
@@ -227,7 +232,7 @@ def print_setup(interval_min: int, n_runs: int, workers: int) -> None:
           f"{1 + (SAR_ACK_RETRANSMISSIONS_COUNT if N_SEGMENTS - 1 > SAR_SEGMENTS_THRESHOLD else 0)}")
     for ttl in (1, 2, 3):
         print(f"  TTL {ttl}: unicast retransmissions timer {unicast_retrans_interval_ms(ttl):g} ms")
-    print(f"Interval {interval_min} min, offset mode '{OFFSET_MODE}', {WARMUP_PERIODS} + {N_PERIODS} + "
+    print(f"Intervals {intervals} min, offset mode '{OFFSET_MODE}', {WARMUP_PERIODS} + {N_PERIODS} + "
           f"{COOLDOWN_PERIODS} periods, {n_runs} runs, {workers} worker process(es)")
 
 
@@ -1711,20 +1716,21 @@ def simulate(su: SiteUniverse, method: str, interval_min: float, run: int,
     return row, pm_rows, sim
 
 
-Task = tuple[str, float, int, int]   # (method, interval in min, run, measured periods)
-_WORKER_UNIVERSE: "SiteUniverse | None" = None
+Task = tuple[str, str, float, int, int]   # (site, method, interval in min, run, measured periods)
+_WORKER_UNIVERSES: dict[str, "SiteUniverse"] = {}
 
 
-def _init_worker(plan_path: str) -> None:
-    """Worker initializer: load the plan file once per process."""
-    global _WORKER_UNIVERSE
-    _WORKER_UNIVERSE = site_universe(load_site_plans(Path(plan_path), METHODS))
+def _init_worker(plan_paths: list[str]) -> None:
+    """Worker initializer: load every plan file once per process."""
+    for path in plan_paths:
+        su = site_universe(load_site_plans(Path(path), METHODS))
+        _WORKER_UNIVERSES[su.plans.name] = su
 
 
 def _run_task(task: Task) -> tuple[Task, dict, list[dict]]:
-    """Worker entry point: simulate one (method, interval, run)."""
-    method, interval, run, n_periods = task
-    row, pm, _ = simulate(_WORKER_UNIVERSE, method, interval, run, n_periods=n_periods)
+    """Worker entry point: simulate one (site, method, interval, run)."""
+    site, method, interval, run, n_periods = task
+    row, pm, _ = simulate(_WORKER_UNIVERSES[site], method, interval, run, n_periods=n_periods)
     return task, row, pm
 
 
@@ -1749,30 +1755,32 @@ def check_reproducibility(su: "SiteUniverse", interval: float) -> None:
 
 def check_workers(pool: ProcessPoolExecutor, su: "SiteUniverse", interval: float) -> None:
     """Simulate the three methods of a short run in the pool and here; the results must be identical."""
-    tasks = [(m, interval, 0, 3) for m in METHODS]
+    tasks = [(su.plans.name, m, interval, 0, 3) for m in METHODS]
     pooled = {t: (row, pm) for t, row, pm in pool.map(_run_task, tasks)}
     for t in tasks:
-        row, pm, _ = simulate(su, t[0], interval, 0, n_periods=3)
+        row, pm, _ = simulate(su, t[1], interval, 0, n_periods=3)
         if without_wall_time(row) != without_wall_time(pooled[t][0]) or pm != pooled[t][1]:
-            raise RuntimeError(f"Results differ between the worker pool and this process ({t[0]})")
+            raise RuntimeError(f"Results differ between the worker pool and this process ({t[1]})")
     print(f"Workers = single process check passed ({len(tasks)} short simulations)")
 
 
-def run_all(pool: ProcessPoolExecutor, interval: float, n_runs: int, out: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Run every (run, method) simulation of the job; checkpoint sim_runs.csv after each one."""
+def run_all(pool: ProcessPoolExecutor, site: str, interval: float, n_runs: int,
+            out: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Run every (run, method) simulation of one job; checkpoint sim_runs.csv after each one."""
     order = sorted(METHODS, key=lambda m: m != "All-relay")          # longest simulations first
-    tasks = [(m, interval, run, N_PERIODS) for m in order for run in range(n_runs)]
+    tasks = [(site, m, interval, run, N_PERIODS) for m in order for run in range(n_runs)]
     rows: list[dict] = []
     meter_rows: list[dict] = []
     t0 = time.perf_counter()
     futures = [pool.submit(_run_task, t) for t in tasks]
     for f in as_completed(futures):
-        (method, _, run, _), row, pm = f.result()
+        (_, method, _, run, _), row, pm = f.result()
         rows.append(row)
         meter_rows.extend(pm)
         elapsed = time.perf_counter() - t0
         eta = elapsed / len(rows) * (len(tasks) - len(rows))
-        print(f"[{len(rows):>4}/{len(tasks)} {elapsed / 60:6.1f} min, ~{eta / 60:5.1f} min left] {method:<20} | "
+        print(f"[{len(rows):>4}/{len(tasks)} {elapsed / 60:6.1f} min, ~{eta / 60:5.1f} min left] "
+              f"{site} {interval:g} min | {method:<20} | "
               f"run {run + 1:>3}/{n_runs} | PDR {100 * row['pdr']:6.2f} % | latency {row['latency_mean_ms']:7.1f} ms | "
               f"coll. {row['collisions_relay_dcu_per_reading']:8.2f}/reading | {row['wall_time_s']:6.1f} s", flush=True)
         if row["unresolved_readings"]:
@@ -2084,18 +2092,23 @@ def write_results(su: "SiteUniverse", interval: int, n_runs: int, runs: pd.DataF
 # ## Command-line entry point
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Command-line arguments."""
-    ap = argparse.ArgumentParser(description="Discrete-event simulation of Bluetooth Mesh metering plans.")
-    ap.add_argument("plans", type=Path, help="path to <site>_plans.json from the planning notebook")
-    ap.add_argument("interval", type=int, help="reporting interval in minutes")
-    ap.add_argument("--runs", type=int, default=N_RUNS, help=f"Monte Carlo runs (default {N_RUNS})")
+    """Command-line arguments (all optional)."""
+    ap = argparse.ArgumentParser(description="Discrete-event simulation of Bluetooth Mesh metering plans: "
+                                             "every <site>_plans.json in --plans-dir x every interval.")
+    ap.add_argument("--plans-dir", type=Path, default=PLANS_DIR,
+                    help=f"folder with <site>_plans.json files (default {PLANS_DIR})")
+    ap.add_argument("--intervals", type=int, nargs="+", default=INTERVALS_MIN,
+                    help=f"reporting intervals in minutes (default {' '.join(map(str, INTERVALS_MIN))})")
+    ap.add_argument("--runs", type=int, default=N_RUNS, help=f"Monte Carlo runs per job (default {N_RUNS})")
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 1,
                     help="worker processes (default: every CPU)")
-    ap.add_argument("--out", type=Path, default=None,
-                    help=f"output folder (default {OUTPUT_ROOT}/<site>_<interval>)")
+    ap.add_argument("--out-root", type=Path, default=OUTPUT_ROOT,
+                    help=f"outputs go to <out-root>/<site>_<interval>/ (default {OUTPUT_ROOT})")
     args = ap.parse_args(argv)
-    if args.interval < 1:
-        ap.error("interval must be at least 1 minute")
+    if min(args.intervals) < 1:
+        ap.error("intervals must be at least 1 minute")
+    if len(set(args.intervals)) != len(args.intervals):
+        ap.error("intervals must be distinct")
     if args.runs < 2:
         ap.error("--runs must be at least 2 (confidence intervals)")
     if args.workers < 1:
@@ -2103,39 +2116,69 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def main(argv: list[str] | None = None) -> None:
-    """Run one job: validation, checks, all simulations of one site and interval, results."""
-    args = parse_args(argv)
-    t_start = time.perf_counter()
-    sp = load_site_plans(args.plans, METHODS)
-    su = site_universe(sp)
-    out = args.out or OUTPUT_ROOT / f"{sp.name}_{args.interval}"
+def run_job(pool: ProcessPoolExecutor, su: "SiteUniverse", interval: int, args: argparse.Namespace) -> pd.DataFrame:
+    """One site and one interval: checks, all simulations, results. Returns the summary."""
+    sp = su.plans
+    out = args.out_root / f"{sp.name}_{interval}"
     (out / "figures").mkdir(parents=True, exist_ok=True)
-    print_setup(args.interval, args.runs, args.workers)
-    print_plans(sp)
-    rp = su.rp
-    print(f"Radio: EIRP {rp.eirp_dbm} dBm, PL(d0) {rp.pl_d0_db:.2f} dB, n {rp.path_loss_exp}, "
-          f"sigma {rp.shadowing_sigma_db} dB, RX threshold {rp.rx_threshold_dbm} dBm, "
-          f"interference threshold {rp.interference_threshold_dbm} dBm")
-    print(f"Output folder: {out}\n")
-
-    run_validation_tests(sp.params)
-    check_reproducibility(su, args.interval)
+    print(f"\n=== Job: site {sp.name}, {interval} min interval, {args.runs} runs -> {out} ===")
+    check_reproducibility(su, interval)
+    check_workers(pool, su, interval)
     config = {k: v for k, v in globals().items()
               if k.isupper() and isinstance(v, (int, float, str, list, tuple, type(None), Path))}
     (out / "sim_metadata.json").write_text(json.dumps(
-        {"site": sp.name, "interval_min": args.interval, "runs": args.runs, "workers": args.workers,
-         "plan_file": str(args.plans.resolve()), "versions": VERSIONS, "config": config,
+        {"site": sp.name, "interval_min": interval, "runs": args.runs, "workers": args.workers,
+         "plan_file": str(sp.path.resolve()), "versions": VERSIONS, "config": config,
          "n_segments": N_SEGMENTS, "airtime_us": AIRTIME_US}, indent=1, default=str))
-
-    with ProcessPoolExecutor(max_workers=args.workers, initializer=_init_worker,
-                             initargs=(str(args.plans.resolve()),)) as pool:
-        check_workers(pool, su, args.interval)
-        print()
-        runs, per_meter_runs = run_all(pool, args.interval, args.runs, out)
+    runs, per_meter_runs = run_all(pool, sp.name, interval, args.runs, out)
     runs.to_csv(out / "sim_runs.csv", index=False)
     per_meter_runs.to_csv(out / "sim_per_meter_runs.csv", index=False)
-    write_results(su, args.interval, args.runs, runs, per_meter_runs, out)
+    write_results(su, interval, args.runs, runs, per_meter_runs, out)
+    return summarize(runs)
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Every <site>_plans.json in the plans folder x every interval: one job each."""
+    args = parse_args(argv)
+    t_start = time.perf_counter()
+    paths = sorted(args.plans_dir.glob("*_plans.json"))
+    if not paths:
+        raise SystemExit(f"No '*_plans.json' in {args.plans_dir.resolve()}.")
+    universes = [site_universe(load_site_plans(p, METHODS)) for p in paths]
+    names = [su.plans.name for su in universes]
+    if len(set(names)) != len(names):
+        raise SystemExit(f"Two plan files have the same site name: {names}")
+    intervals = sorted(args.intervals)
+    print_setup(intervals, args.runs, args.workers)
+    print(f"{len(universes)} site(s) x {len(intervals)} interval(s) = {len(universes) * len(intervals)} jobs, "
+          f"{len(universes) * len(intervals) * args.runs * len(METHODS)} simulations")
+    for su in universes:
+        print(f"  {su.plans.path}")
+
+    summaries = []
+    with ProcessPoolExecutor(max_workers=args.workers, initializer=_init_worker,
+                             initargs=([str(p.resolve()) for p in paths],)) as pool:
+        for su in universes:
+            print()
+            print_plans(su.plans)
+            rp = su.rp
+            print(f"Radio: EIRP {rp.eirp_dbm} dBm, PL(d0) {rp.pl_d0_db:.2f} dB, n {rp.path_loss_exp}, "
+                  f"sigma {rp.shadowing_sigma_db} dB, RX threshold {rp.rx_threshold_dbm} dBm, "
+                  f"interference threshold {rp.interference_threshold_dbm} dBm")
+            run_validation_tests(su.plans.params)
+            for interval in intervals:
+                summaries.append(run_job(pool, su, interval, args))
+                all_summary = pd.concat(summaries, ignore_index=True)
+                all_summary.to_csv(args.out_root / "summary_all.csv", index=False)
+
+    print("\n=== All jobs: PDR (%), mean latency (ms), collisions at relays and DCUs per reading "
+          "(mean ± 95 % CI) ===")
+    for _, r in all_summary.iterrows():
+        print(f"  {r['site']:<16} {r['interval_min']:>3g} min | {r['method']:<20} | "
+              f"PDR {100 * r['pdr']:6.2f} ± {100 * r['pdr_ci95']:5.2f} | "
+              f"latency {r['latency_mean_ms']:7.1f} ± {r['latency_mean_ms_ci95']:5.1f} | "
+              f"coll. {r['collisions_relay_dcu_per_reading']:9.2f} ± {r['collisions_relay_dcu_per_reading_ci95']:7.2f}")
+    print(f"Saved {args.out_root / 'summary_all.csv'}")
     print(f"Total time {(time.perf_counter() - t_start) / 60:.1f} min")
 
 
