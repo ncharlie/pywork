@@ -42,33 +42,47 @@ jupytext --to ipynb -o notebooks/dcu_relay_planning.ipynb src/dcu_relay_planning
 
 # Simulation of the plans
 
-`notebooks/mesh_simulation.ipynb` is a discrete-event simulator (plain Python, `heapq`) of Bluetooth
-Mesh over the advertising bearer. It evaluates the plans in `<site>_plans.json`. Each meter sends a
-200-byte reading every interval as 18 SAR segments. The segments are flooded through the planned
-relays and acknowledged by the DCU, following the Mesh Protocol 1.1 SAR rules (SAR Transmitter and
-SAR Receiver states, including the retransmission counters with and without progress). All transmissions of a site share the three advertising
-channels, so they can collide. The notebook explains the model and every assumption, runs seven
-deterministic validation tests and a reproducibility check before the main runs, uses common
-random numbers across methods, and checks after the runs whether the number of Monte Carlo runs
-is enough to tell the methods apart.
+`src/mesh_simulation.py` is a discrete-event simulator (plain Python, `heapq`) of Bluetooth Mesh
+over the advertising bearer, run from the terminal. It evaluates the plans in `<site>_plans.json`.
+Each meter sends a 200-byte reading every interval as 18 SAR segments. The segments are flooded
+through the planned relays and acknowledged by the DCU, following the Mesh Protocol 1.1 SAR rules
+(SAR Transmitter and SAR Receiver states, including the retransmission counters with and without
+progress). All transmissions of a site share the three advertising channels, so they can collide.
+The model and every assumption are explained in the comments of the script. Before the main runs it
+runs seven deterministic validation tests, a reproducibility check and a check that the worker
+processes give the same results as a single process. After the runs it checks whether the number of
+Monte Carlo runs is enough to tell the methods apart.
 
-## Usage (SageMaker Studio)
+## Usage
 
-1. Copy the plan files to `/home/sagemaker-user/plans/<site>_plans.json`.
-2. Edit the configuration cell if needed (for example `SITES`, `INTERVALS_MIN = [15, 5, 1]`, `N_RUNS`,
-   `OFFSET_MODE`, `COLLISION_MODEL`), then choose *Run → Run All Cells*.
+One site and one reporting interval (in minutes) per call:
 
-## Outputs (`/home/sagemaker-user/results/<site>/`)
+```
+python src/mesh_simulation.py /path/to/<site>_plans.json 15
+python src/mesh_simulation.py /path/to/<site>_plans.json 5 --runs 100 --workers 16 --out /some/folder
+```
+
+| Option | Default |
+|---|---|
+| `--runs` | 100 Monte Carlo runs |
+| `--workers` | every CPU; the simulations (runs x methods) are spread over these processes |
+| `--out` | `/workspace/sim_results/<site>_<interval>/` |
+
+Every other parameter (traffic, radio, bearer, SAR) is in the configuration section at the top of
+the script. Results do not depend on the number of workers: every simulation rebuilds its random
+draws from its own seeds.
+
+## Outputs
 
 | File | Content |
 |---|---|
-| `sim_runs.csv` | One row per method, interval and run: PDR, segment delivery ratio, latency (mean, median, p95), transmissions per reading by type, collisions, SAR rounds |
-| `sim_summary.csv` | Mean and 95 % confidence interval over runs per method and interval |
+| `sim_runs.csv` | One row per method and run: PDR, segment delivery ratio, latency (mean, median, p95), transmissions per reading by type, collisions, SAR rounds |
+| `sim_summary.csv` | Mean and 95 % confidence interval over runs per method |
 | `sim_run_adequacy.csv` | Per pair of methods and metric: mean per-run difference, its 95 % CI, and whether the number of runs is enough |
-| `sim_table.tex` | LaTeX `tabular` (Site, Method, PDR, Collisions, Latency) per interval |
+| `sim_table.tex` | LaTeX `tabular` (Site, Method, PDR, Collisions, Latency) |
 | `sim_per_meter_runs.csv`, `sim_per_meter.csv` | Per-meter delivered readings, per run and pooled |
-| `sim_metadata.json` | Configuration and package versions |
-| `figures/` | PDR by method, PDR and latency against the interval, per-meter PDR maps (local coordinates) |
+| `sim_metadata.json` | Arguments, configuration and package versions |
+| `figures/` | PDR by method, per-meter PDR map (local coordinates) |
 
-`src/mesh_simulation.py` is the jupytext source of the notebook. Regenerate the notebook with
-`jupytext --to ipynb -o notebooks/mesh_simulation.ipynb src/mesh_simulation.py`.
+`notebooks/mesh_simulation.ipynb` is the earlier notebook version of the simulator. It is no longer
+updated; use the script.
