@@ -15,16 +15,16 @@ Usage::
     python src/mesh_simulation.py
     python src/mesh_simulation.py --intervals 15 5 --runs 50 --workers 16
 
-Without arguments it simulates every ``<site>_plans.json`` in ``/workspace/sim_results`` for the
-reporting intervals 1, 5, 10 and 15 min (one job per site and interval), 100 Monte Carlo runs each.
-The outputs of a job go to ``/workspace/sim_results/<site>_<interval>/``, and ``summary_all.csv``
-in the same folder collects the summaries of all jobs. The simulations (runs x methods) are spread
+Without arguments it simulates every ``<site>_plans.json`` in ``/workspace/sim_inputs`` for the
+reporting intervals 1, 5, 10 and 15 min, 100 Monte Carlo runs each. The outputs of a site go to
+``/workspace/sim_results/<site>/``; every file holds all intervals of that site (column
+``interval_min``). The simulations (runs x methods) are spread
 over ``--workers`` processes (default: every CPU). Every simulation rebuilds its random draws from
 its own seeds, so the results do not depend on the number of workers.
 
-Before the main runs of each site the script runs seven deterministic validation tests, and before
-each job a reproducibility check (same seed twice) and a check that the worker pool gives the same
-results as a single process; it stops if any fails.
+Before the simulations of each site the script runs seven deterministic validation tests, and before
+each interval a reproducibility check (same seed twice) and a check that the worker pool gives the
+same results as a single process; it stops if any fails.
 
 Sections of this file: configuration; 0 setup and derived constants; 1 model and assumptions;
 2 plan loader; 3 propagation model and random streams; 4 simulator; 5 validation tests; 6 running
@@ -41,9 +41,9 @@ Coordinates in the plan files are local (metres) and confidential, so no plot us
 from pathlib import Path
 
 # --- Input / output -------------------------------------------------------------
-PLANS_DIR = Path("/workspace/sim_results")    # default: every <site>_plans.json in this folder
-INTERVALS_MIN = [1, 5, 10, 15]                # default reporting intervals (min), one job each
-OUTPUT_ROOT = Path("/workspace/sim_results")  # outputs: OUTPUT_ROOT/<site>_<interval>/
+PLANS_DIR = Path("/workspace/sim_inputs")     # default: every <site>_plans.json in this folder
+INTERVALS_MIN = [1, 5, 10, 15]                # default reporting intervals (min)
+OUTPUT_ROOT = Path("/workspace/sim_results")  # outputs: OUTPUT_ROOT/<site>/, all intervals together
 METHODS: list[str] = ["Proposed", "Min-hop + min-relay", "All-relay"]  # order used in tables/plots
 
 # --- Traffic ----------------------------------------------------------------------
@@ -54,7 +54,7 @@ N_PERIODS = 20                       # measured reporting periods per run
 WARMUP_PERIODS = 1                   # simulated before the measured periods, excluded from statistics
 COOLDOWN_PERIODS = 1                 # simulated after them (keeps the load on), excluded from statistics
 N_RUNS = 100                         # default Monte Carlo runs (--runs); methods share random draws
-BASE_SEED = 20240501
+BASE_SEED = 20260927
 
 # --- Radio and propagation (None = value from the plan file) ------------------------
 EIRP_DBM: float | None = None
@@ -1735,8 +1735,8 @@ def _run_task(task: Task) -> tuple[Task, dict, list[dict]]:
 
 
 def row_key(row: dict) -> tuple:
-    """Sort key of a result row: run, then method in METHODS order."""
-    return row["run"], METHODS.index(row["method"])
+    """Sort key of a result row: interval, run, then method in METHODS order."""
+    return row["interval_min"], row["run"], METHODS.index(row["method"])
 
 
 def without_wall_time(row: dict) -> dict:
@@ -1764,9 +1764,12 @@ def check_workers(pool: ProcessPoolExecutor, su: "SiteUniverse", interval: float
     print(f"Workers = single process check passed ({len(tasks)} short simulations)")
 
 
-def run_all(pool: ProcessPoolExecutor, site: str, interval: float, n_runs: int,
-            out: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Run every (run, method) simulation of one job; checkpoint sim_runs.csv after each one."""
+def run_all(pool: ProcessPoolExecutor, site: str, interval: float, n_runs: int, out: Path,
+            earlier_rows: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Run every (run, method) simulation of one site and interval.
+
+    ``sim_runs.csv`` (this interval plus the site's ``earlier_rows``) is rewritten after each one.
+    """
     order = sorted(METHODS, key=lambda m: m != "All-relay")          # longest simulations first
     tasks = [(site, m, interval, run, N_PERIODS) for m in order for run in range(n_runs)]
     rows: list[dict] = []
@@ -1785,11 +1788,11 @@ def run_all(pool: ProcessPoolExecutor, site: str, interval: float, n_runs: int,
               f"coll. {row['collisions_relay_dcu_per_reading']:8.2f}/reading | {row['wall_time_s']:6.1f} s", flush=True)
         if row["unresolved_readings"]:
             print(f"    warning: {row['unresolved_readings']} measured readings still in progress at the end")
-        pd.DataFrame(sorted(rows, key=row_key)).to_csv(out / "sim_runs.csv", index=False)
+        pd.DataFrame(sorted(earlier_rows + rows, key=row_key)).to_csv(out / "sim_runs.csv", index=False)
     print(f"All {len(tasks)} simulations done in {(time.perf_counter() - t0) / 60:.1f} min")
     rows.sort(key=row_key)
     meter_rows.sort(key=lambda r: (*row_key(r), r["meter_id"]))
-    return pd.DataFrame(rows), pd.DataFrame(meter_rows)
+    return rows, meter_rows
 
 
 # ## Part 7 — Results
@@ -1837,12 +1840,12 @@ def summarize(runs: pd.DataFrame) -> pd.DataFrame:
         rows.append(row)
     out = pd.DataFrame(rows)
     out["_o"] = out["method"].map(order)
-    return out.sort_values(["site", "interval_min", "_o"], ascending=[True, False, True]).drop(columns="_o").reset_index(drop=True)
+    return out.sort_values(["site", "interval_min", "_o"]).drop(columns="_o").reset_index(drop=True)
 
 
 def print_summary(summary: pd.DataFrame) -> None:
     """Print the main metrics, mean ± 95 % CI half-width, and the transmissions per reading."""
-    show = summary[["method", "runs", "n_relays"]].copy()
+    show = summary[["interval_min", "method", "runs", "n_relays"]].copy()
     for m, scale, fmt in (("pdr", 100, "{:.2f} ± {:.2f}"), ("seg_delivery_ratio", 100, "{:.2f} ± {:.2f}"),
                           ("latency_mean_ms", 1, "{:.0f} ± {:.0f}"), ("latency_p95_ms", 1, "{:.0f} ± {:.0f}"),
                           ("tx_total_per_reading", 1, "{:.1f} ± {:.1f}"),
@@ -1859,7 +1862,7 @@ def print_summary(summary: pd.DataFrame) -> None:
                "collisions_relay_dcu_new_per_reading", "collisions_nonrelay",
                "halfduplex_losses", "frac_readings_retx", "sender_ack_ratio"]
     print("\nNetwork PDU transmissions per measured reading, by type (mean over runs):")
-    print(summary[["method"] + tx_cols].round(3).to_string(index=False))
+    print(summary[["interval_min", "method"] + tx_cols].round(3).to_string(index=False))
 
 
 # ### Is the number of runs enough?
@@ -1940,7 +1943,7 @@ def print_adequacy(adequacy: pd.DataFrame, n_runs: int) -> None:
             f"  -> about {int(r['runs_needed_estimate'])} runs needed" if pd.notna(r["runs_needed_estimate"])
             else "  -> no estimate: the mean difference is 0" if r["mean_diff"] == 0
             else "  -> more than 10,000 runs needed (difference ~ 0)")
-        print(f"  {r['metric']:<33} | {r['comparison']:<42} | {k * r['mean_diff']:+9.3f} ± "
+        print(f"  {r['interval_min']:>3g} min | {r['metric']:<33} | {r['comparison']:<42} | {k * r['mean_diff']:+9.3f} ± "
               f"{k * r['ci95_half_width']:7.3f}{unit} [{k * r['ci95_low']:+9.3f}, {k * r['ci95_high']:+9.3f}] | "
               f"{r['verdict']}{need}")
     n_flag = int((adequacy["verdict"] != "enough").sum())
@@ -1994,21 +1997,53 @@ plt.rcParams.update({"axes.spines.top": False, "axes.spines.right": False, "axes
                      "grid.color": "0.9", "grid.linewidth": 0.6, "axes.axisbelow": True})
 
 
-def plot_pdr_by_method(summary: pd.DataFrame, site: str, interval: int, path: Path) -> None:
-    """Bar chart of the mean PDR per method with 95 % CI error bars."""
-    fig, ax = plt.subplots(figsize=(6, 4.4))
+METHOD_MARKERS = dict(zip(METHODS, ["o", "s", "^", "D", "v"]))
+
+
+def plot_pdr_by_method(summary: pd.DataFrame, site: str, path: Path) -> None:
+    """Grouped bars: mean PDR per method for every interval, with 95 % CI error bars."""
+    intervals = sorted(summary["interval_min"].unique())
+    width = 0.8 / len(METHODS)
+    fig, ax = plt.subplots(figsize=(max(6.0, 2.2 * len(intervals) + 2), 4.6))
     for k, m in enumerate(METHODS):
-        r = summary[summary.method == m].iloc[0]
-        bar = ax.bar(k, 100 * r["pdr"], 0.7, yerr=100 * r["pdr_ci95"], capsize=4, color=METHOD_COLORS[m],
-                     label=m, error_kw={"elinewidth": 1, "ecolor": "0.25"})[0]
-        top = 100 * (r["pdr"] + (r["pdr_ci95"] if np.isfinite(r["pdr_ci95"]) else 0.0))
-        ax.annotate(f"{100 * r['pdr']:.2f}", (bar.get_x() + bar.get_width() / 2, top), xytext=(0, 3),
-                    textcoords="offset points", ha="center", va="bottom", fontsize=8, color="0.2")
-    ax.set_xticks(range(len(METHODS)), METHODS)
+        g = summary[summary.method == m].set_index("interval_min").reindex(intervals)
+        x = np.arange(len(intervals)) + (k - (len(METHODS) - 1) / 2) * width
+        bars = ax.bar(x, 100 * g["pdr"], width * 0.92, yerr=100 * g["pdr_ci95"], capsize=3,
+                      color=METHOD_COLORS[m], label=m, error_kw={"elinewidth": 1, "ecolor": "0.25"})
+        for b, v, ci in zip(bars, 100 * g["pdr"], 100 * g["pdr_ci95"].fillna(0)):
+            ax.annotate(f"{v:.1f}", (b.get_x() + b.get_width() / 2, v + ci), xytext=(0, 3),
+                        textcoords="offset points", ha="center", va="bottom", fontsize=7, color="0.2")
+    ax.set_xticks(np.arange(len(intervals)), [f"{iv:g} min" for iv in intervals])
     ax.set_ylim(max(0.0, 100 * np.nanmin(summary["pdr"] - summary["pdr_ci95"]) - 5),
                 max(101.0, 100 * np.nanmax(summary["pdr"] + summary["pdr_ci95"]) + 1.5))
     ax.set_ylabel("PDR (%)")
-    ax.set_title(f"Site {site}, {interval} min interval ({OFFSET_MODE} offsets, {COLLISION_MODEL})", fontsize=10)
+    ax.set_xlabel("Reporting interval")
+    ax.set_title(f"Site {site}: PDR by method ({OFFSET_MODE} offsets, {COLLISION_MODEL})", fontsize=10)
+    handles, labels = ax.get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=len(METHODS), frameon=False)
+    fig.tight_layout(rect=(0, 0.08, 1, 1))
+    fig.savefig(path, dpi=FIG_DPI)
+    plt.close(fig)
+
+
+def plot_vs_interval(summary: pd.DataFrame, site: str, path: Path) -> None:
+    """PDR and mean latency against the reporting interval, one line per method (95 % CI bars)."""
+    intervals = sorted(summary["interval_min"].unique())
+    fig, axes = plt.subplots(2, 1, figsize=(6, 7.5), sharex=True)
+    for m in METHODS:
+        g = summary[summary.method == m].sort_values("interval_min")
+        kw = dict(color=METHOD_COLORS[m], marker=METHOD_MARKERS[m], lw=2, ms=7, capsize=3, label=m)
+        axes[0].errorbar(g["interval_min"], 100 * g["pdr"], yerr=100 * g["pdr_ci95"], **kw)
+        axes[1].errorbar(g["interval_min"], g["latency_mean_ms"], yerr=g["latency_mean_ms_ci95"], **kw)
+    for ax in axes:
+        ax.set_xscale("log")
+        ax.set_xticks(intervals, [f"{iv:g}" for iv in intervals])
+        ax.minorticks_off()
+    axes[0].set_title(f"Site {site}")
+    axes[0].set_ylabel("PDR (%)")
+    axes[1].set_ylabel("Mean latency (ms)")
+    axes[1].set_xlabel("Reporting interval (min, log scale)")
+    axes[0].legend(frameon=False)
     fig.tight_layout()
     fig.savefig(path, dpi=FIG_DPI)
     plt.close(fig)
@@ -2054,10 +2089,14 @@ def plot_per_meter_map(sp: SitePlans, per_meter: pd.DataFrame, interval: int, n_
     plt.close(fig)
 
 
-def write_results(su: "SiteUniverse", interval: int, n_runs: int, runs: pd.DataFrame,
-                  per_meter_runs: pd.DataFrame, out: Path) -> None:
-    """Summary, check of the number of runs, LaTeX table, per-meter PDR and plots."""
+def write_results(su: "SiteUniverse", n_runs: int, runs: pd.DataFrame,
+                  per_meter_runs: pd.DataFrame, out: Path) -> pd.DataFrame:
+    """Summary, check of the number of runs, LaTeX table, per-meter PDR and plots of one site.
+
+    ``runs`` holds every interval simulated so far; each file covers all of them. Returns the summary.
+    """
     site = su.plans.name
+    intervals = sorted(runs["interval_min"].unique())
     summary = summarize(runs)
     summary.to_csv(out / "sim_summary.csv", index=False)
     print()
@@ -2068,25 +2107,29 @@ def write_results(su: "SiteUniverse", interval: int, n_runs: int, runs: pd.DataF
     print()
     print_adequacy(adequacy, n_runs)
 
-    latex = latex_table(summary, interval, n_runs)
+    latex = "\n\n".join(latex_table(summary, iv, n_runs) for iv in intervals)
     (out / "sim_table.tex").write_text(latex + "\n")
     print()
     print(latex)
 
-    per_meter = (per_meter_runs.groupby(["method", "meter_id"], sort=False)[["n_readings", "n_delivered"]]
-                 .sum().reset_index())
+    per_meter = (per_meter_runs.groupby(["site", "interval_min", "method", "meter_id"], sort=False)
+                 [["n_readings", "n_delivered"]].sum().reset_index())
     per_meter["pdr"] = per_meter["n_delivered"] / per_meter["n_readings"]
-    per_meter.insert(0, "site", site)
-    per_meter.insert(2, "interval_min", interval)
     per_meter.to_csv(out / "sim_per_meter.csv", index=False)
-    worst = per_meter.sort_values("pdr").groupby("method", sort=False).head(5)
-    print("\nFive lowest per-meter PDRs per method:")
-    print(worst[["method", "meter_id", "n_readings", "n_delivered", "pdr"]].to_string(index=False))
+    worst = per_meter.sort_values("pdr").groupby(["interval_min", "method"], sort=True).head(5)
+    print("\nFive lowest per-meter PDRs per interval and method:")
+    print(worst.sort_values(["interval_min", "method", "pdr"])
+          [["interval_min", "method", "meter_id", "n_readings", "n_delivered", "pdr"]].to_string(index=False))
 
-    plot_pdr_by_method(summary, site, interval, out / "figures" / "pdr_by_method.png")
-    plot_per_meter_map(su.plans, per_meter, interval, n_runs, out / "figures" / "per_meter_pdr.png")
-    print(f"\nSaved in {out}: sim_runs.csv, sim_per_meter_runs.csv, sim_summary.csv, sim_run_adequacy.csv, "
-          f"sim_table.tex, sim_per_meter.csv, sim_metadata.json, figures/")
+    plot_pdr_by_method(summary, site, out / "figures" / "pdr_by_method.png")
+    if len(intervals) > 1:
+        plot_vs_interval(summary, site, out / "figures" / "pdr_latency_vs_interval.png")
+    for iv in intervals:
+        plot_per_meter_map(su.plans, per_meter[per_meter.interval_min == iv], int(iv), n_runs,
+                           out / "figures" / f"per_meter_pdr_{iv:g}min.png")
+    print(f"\nSaved in {out} (intervals {[int(i) for i in intervals]} min): sim_runs.csv, sim_per_meter_runs.csv, "
+          f"sim_summary.csv, sim_run_adequacy.csv, sim_table.tex, sim_per_meter.csv, sim_metadata.json, figures/")
+    return summary
 
 
 # ## Command-line entry point
@@ -2094,16 +2137,17 @@ def write_results(su: "SiteUniverse", interval: int, n_runs: int, runs: pd.DataF
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Command-line arguments (all optional)."""
     ap = argparse.ArgumentParser(description="Discrete-event simulation of Bluetooth Mesh metering plans: "
-                                             "every <site>_plans.json in --plans-dir x every interval.")
+                                             "every <site>_plans.json in --plans-dir, every interval.")
     ap.add_argument("--plans-dir", type=Path, default=PLANS_DIR,
                     help=f"folder with <site>_plans.json files (default {PLANS_DIR})")
     ap.add_argument("--intervals", type=int, nargs="+", default=INTERVALS_MIN,
                     help=f"reporting intervals in minutes (default {' '.join(map(str, INTERVALS_MIN))})")
-    ap.add_argument("--runs", type=int, default=N_RUNS, help=f"Monte Carlo runs per job (default {N_RUNS})")
+    ap.add_argument("--runs", type=int, default=N_RUNS,
+                    help=f"Monte Carlo runs per site and interval (default {N_RUNS})")
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 1,
                     help="worker processes (default: every CPU)")
     ap.add_argument("--out-root", type=Path, default=OUTPUT_ROOT,
-                    help=f"outputs go to <out-root>/<site>_<interval>/ (default {OUTPUT_ROOT})")
+                    help=f"outputs go to <out-root>/<site>/ (default {OUTPUT_ROOT})")
     args = ap.parse_args(argv)
     if min(args.intervals) < 1:
         ap.error("intervals must be at least 1 minute")
@@ -2116,29 +2160,45 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def run_job(pool: ProcessPoolExecutor, su: "SiteUniverse", interval: int, args: argparse.Namespace) -> pd.DataFrame:
-    """One site and one interval: checks, all simulations, results. Returns the summary."""
+def run_site(pool: ProcessPoolExecutor, su: "SiteUniverse", intervals: list[int],
+             args: argparse.Namespace) -> pd.DataFrame:
+    """Every interval of one site; outputs (all intervals together) in <out-root>/<site>/."""
     sp = su.plans
-    out = args.out_root / f"{sp.name}_{interval}"
+    out = args.out_root / sp.name
     (out / "figures").mkdir(parents=True, exist_ok=True)
-    print(f"\n=== Job: site {sp.name}, {interval} min interval, {args.runs} runs -> {out} ===")
-    check_reproducibility(su, interval)
-    check_workers(pool, su, interval)
+    print()
+    print_plans(sp)
+    rp = su.rp
+    print(f"Radio: EIRP {rp.eirp_dbm} dBm, PL(d0) {rp.pl_d0_db:.2f} dB, n {rp.path_loss_exp}, "
+          f"sigma {rp.shadowing_sigma_db} dB, RX threshold {rp.rx_threshold_dbm} dBm, "
+          f"interference threshold {rp.interference_threshold_dbm} dBm")
+    print(f"Output folder: {out}")
+    run_validation_tests(sp.params)
     config = {k: v for k, v in globals().items()
               if k.isupper() and isinstance(v, (int, float, str, list, tuple, type(None), Path))}
     (out / "sim_metadata.json").write_text(json.dumps(
-        {"site": sp.name, "interval_min": interval, "runs": args.runs, "workers": args.workers,
+        {"site": sp.name, "intervals_min": intervals, "runs": args.runs, "workers": args.workers,
          "plan_file": str(sp.path.resolve()), "versions": VERSIONS, "config": config,
          "n_segments": N_SEGMENTS, "airtime_us": AIRTIME_US}, indent=1, default=str))
-    runs, per_meter_runs = run_all(pool, sp.name, interval, args.runs, out)
-    runs.to_csv(out / "sim_runs.csv", index=False)
-    per_meter_runs.to_csv(out / "sim_per_meter_runs.csv", index=False)
-    write_results(su, interval, args.runs, runs, per_meter_runs, out)
-    return summarize(runs)
+    rows: list[dict] = []
+    meter_rows: list[dict] = []
+    summary = pd.DataFrame()
+    for interval in intervals:
+        print(f"\n=== Site {sp.name}, {interval} min interval, {args.runs} runs ===")
+        check_reproducibility(su, interval)
+        check_workers(pool, su, interval)
+        r, m = run_all(pool, sp.name, interval, args.runs, out, rows)
+        rows += r
+        meter_rows += m
+        runs, per_meter_runs = pd.DataFrame(rows), pd.DataFrame(meter_rows)
+        runs.to_csv(out / "sim_runs.csv", index=False)
+        per_meter_runs.to_csv(out / "sim_per_meter_runs.csv", index=False)
+        summary = write_results(su, args.runs, runs, per_meter_runs, out)   # all intervals so far
+    return summary
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Every <site>_plans.json in the plans folder x every interval: one job each."""
+    """Every <site>_plans.json in the plans folder, every interval."""
     args = parse_args(argv)
     t_start = time.perf_counter()
     paths = sorted(args.plans_dir.glob("*_plans.json"))
@@ -2150,7 +2210,7 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(f"Two plan files have the same site name: {names}")
     intervals = sorted(args.intervals)
     print_setup(intervals, args.runs, args.workers)
-    print(f"{len(universes)} site(s) x {len(intervals)} interval(s) = {len(universes) * len(intervals)} jobs, "
+    print(f"{len(universes)} site(s) x {len(intervals)} interval(s) x {args.runs} runs x {len(METHODS)} methods = "
           f"{len(universes) * len(intervals) * args.runs * len(METHODS)} simulations")
     for su in universes:
         print(f"  {su.plans.path}")
@@ -2159,26 +2219,15 @@ def main(argv: list[str] | None = None) -> None:
     with ProcessPoolExecutor(max_workers=args.workers, initializer=_init_worker,
                              initargs=([str(p.resolve()) for p in paths],)) as pool:
         for su in universes:
-            print()
-            print_plans(su.plans)
-            rp = su.rp
-            print(f"Radio: EIRP {rp.eirp_dbm} dBm, PL(d0) {rp.pl_d0_db:.2f} dB, n {rp.path_loss_exp}, "
-                  f"sigma {rp.shadowing_sigma_db} dB, RX threshold {rp.rx_threshold_dbm} dBm, "
-                  f"interference threshold {rp.interference_threshold_dbm} dBm")
-            run_validation_tests(su.plans.params)
-            for interval in intervals:
-                summaries.append(run_job(pool, su, interval, args))
-                all_summary = pd.concat(summaries, ignore_index=True)
-                all_summary.to_csv(args.out_root / "summary_all.csv", index=False)
+            summaries.append(run_site(pool, su, intervals, args))
 
-    print("\n=== All jobs: PDR (%), mean latency (ms), collisions at relays and DCUs per reading "
+    print("\n=== All sites: PDR (%), mean latency (ms), collisions at relays and DCUs per reading "
           "(mean ± 95 % CI) ===")
-    for _, r in all_summary.iterrows():
+    for _, r in pd.concat(summaries, ignore_index=True).iterrows():
         print(f"  {r['site']:<16} {r['interval_min']:>3g} min | {r['method']:<20} | "
               f"PDR {100 * r['pdr']:6.2f} ± {100 * r['pdr_ci95']:5.2f} | "
               f"latency {r['latency_mean_ms']:7.1f} ± {r['latency_mean_ms_ci95']:5.1f} | "
               f"coll. {r['collisions_relay_dcu_per_reading']:9.2f} ± {r['collisions_relay_dcu_per_reading_ci95']:7.2f}")
-    print(f"Saved {args.out_root / 'summary_all.csv'}")
     print(f"Total time {(time.perf_counter() - t_start) / 60:.1f} min")
 
 
