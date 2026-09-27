@@ -73,7 +73,6 @@ MIP_REL_GAP = 1e-6                  # relative MIP gap at which HiGHS stops
 TTL_MAX = 127                       # Bluetooth Mesh maximum TTL; caps the hop count H
 RANDOM_SEED = 20240501              # HiGHS random_seed, numpy and random
 HIGHS_LOG = False                   # True = show the HiGHS solver log
-WARM_START_PRUNING = True           # also try the relay-pruning heuristic as MIP start (see 2.3)
 
 # --- Verification -----------------------------------------------------------------
 BRUTE_FORCE_MAX_METERS = 12         # size of the instances checked by exhaustive search
@@ -827,8 +826,9 @@ for site in sites.values():
 # when the installed `highspy` has it, and otherwise through the **low-level** interface
 # (`addVars` / `addRows`). Both give the same model; the brute-force check below solves with both.
 #
-# HiGHS receives a **MIP start** (see 2.3). Before it is passed, the start vector is checked
-# against every row, bound and integrality requirement of the model.
+# The minimum-hop plan of Part 3 is passed as a **MIP start**. It is built in 2.3 because the
+# solver needs it; Part 3 reuses the same function as the baseline. Before it is passed to
+# HiGHS, the start vector is checked against every row, bound and integrality requirement.
 
 # %%
 @dataclass
@@ -989,26 +989,13 @@ def load_model(h: highspy.Highs, model: MilpModel, api: str) -> None:
         raise AssertionError("HiGHS model size differs from the built model")
 
 # %% [markdown]
-# ### 2.3 Plans, MIP starts, and the solver
+# ### 2.3 Plans, the minimum-hop MIP start, and the solver
 #
 # A **plan** of a unit is a DCU pole, a relay set and one parent per meter (a meter or the DCU).
-# Any plan whose parent links form a tree rooted at the DCU, whose meter parents are relays and
-# whose depth is at most $H$ is a feasible point of 2.1 with $h_i$ = depth of $i$.
-# Two such plans are built, and the one with the smaller objective is passed to HiGHS:
-#
-# * **Minimum-hop plan** (the Part 3 baseline, built here because the solver needs it): a
-#   shortest-path tree by BFS from the DCU; every meter with a child relays; $h_i = \delta_{ic}$.
-#   With `fixed_site`, the same tree at the fixed pole.
-# * **Relay pruning** (`WARM_START_PRUNING`): for each candidate site, start with all meters
-#   relaying and switch relays off one at a time, largest $|A(j)|$ first (ties by index), keeping
-#   a switch-off whenever every meter still reaches the DCU through relays within $H$ hops. The
-#   result is a minimal relay set; its plan is the BFS tree through the relays.
-#
-# The MIP start only affects how fast HiGHS finds good solutions, never the model or its
-# optimum. The LP relaxation of 2.1 is weak (relay selection is a connected-dominating-set
-# problem), so on large units HiGHS may stop at the time limit close to its start; the reported
-# lower bound $\lfloor LB \rfloor$ shows how far such a solution can be from optimal. The solve
-# time reported for the MILP methods includes building the MIP starts.
+# The minimum-hop plan (defined formally in Part 3) builds a shortest-path tree by BFS from the
+# DCU and makes every meter with a child a relay. It satisfies every constraint of 2.1 with
+# $h_i = \delta_{ic}$ (the BFS depth), provided $\max_i \delta_{ic} \le H$, so it is a valid MIP start.
+# For the ablation (`fixed_site`), the same shortest-path tree at the fixed pole is used.
 
 # %%
 @dataclass
@@ -1027,8 +1014,6 @@ class Plan:
         objective, best_bound, gap: HiGHS objective, dual bound and relative gap (MILP only).
         primary_lb: floor(best_bound): lower bound on the optimal redundant rebroadcasts.
         fallback: True if the solver returned no solution and the MIP start was used instead.
-        start: Name of the plan passed to HiGHS as MIP start (MILP only).
-        start_objective: Objective value of that MIP start.
     """
     method: str
     uid: int
@@ -1043,8 +1028,6 @@ class Plan:
     gap: float = float("nan")
     primary_lb: float = float("nan")
     fallback: bool = False
-    start: str = "-"
-    start_objective: float = float("nan")
 
 
 def shortest_path_tree(unit: PlanningUnit, k: int) -> tuple[np.ndarray, float]:
@@ -1103,73 +1086,6 @@ def min_hop_plan(unit: PlanningUnit) -> Plan:
     return plan
 
 
-def adjacency_matrix(unit: PlanningUnit) -> scipy.sparse.csr_matrix:
-    """Symmetric 0/1 meter-meter adjacency matrix of a unit (CSR)."""
-    rows = np.repeat(np.arange(unit.N), unit.degree)
-    cols = np.concatenate(unit.A) if unit.N else np.array([], dtype=int)
-    return scipy.sparse.csr_matrix((np.ones(len(rows), dtype=np.float32), (rows, cols)), shape=(unit.N, unit.N))
-
-
-def reach_hops_fast(adj: scipy.sparse.csr_matrix, sources: np.ndarray, forwards: np.ndarray) -> np.ndarray:
-    """Vectorised equivalent of ``bfs_hops(A, sources, forwards)`` (one sparse product per layer)."""
-    hops = np.full(adj.shape[0], -1, dtype=int)
-    frontier = np.zeros(adj.shape[0], dtype=bool)
-    frontier[sources] = True
-    hops[frontier] = 1
-    d = 1
-    while True:
-        fwd = frontier & forwards
-        if not fwd.any():
-            return hops
-        frontier = (adj @ fwd.astype(np.float32) > 0) & (hops < 0)
-        if not frontier.any():
-            return hops
-        d += 1
-        hops[frontier] = d
-
-
-def relay_tree(unit: PlanningUnit, k: int, relays: np.ndarray) -> np.ndarray:
-    """Parent array of the BFS tree through relays: each meter's parent is its nearest relay
-    neighbour one flooding hop closer to the DCU at ``k`` (or the DCU for meters in D(k))."""
-    hops = bfs_hops(unit.A, unit.D[k], forwards=relays)
-    parent = np.full(unit.N, -1, dtype=int)
-    for i in np.flatnonzero(hops > 1):
-        prev = unit.A[i][(hops[unit.A[i]] == hops[i] - 1) & relays[unit.A[i]]]
-        parent[i] = int(prev[np.argmin(unit.dist_mm[i, prev])])
-    return parent
-
-
-def pruned_relay_plan(unit: PlanningUnit, fixed_site: int | None = None, ttl_max: int = TTL_MAX) -> Plan:
-    """Relay-pruning heuristic (MIP start only).
-
-    For each candidate site (or only ``fixed_site``), start with every meter relaying and try to
-    switch relays off one by one, most expensive first (largest |A(j)|, ties by index); a switch-off
-    is kept if every meter still reaches the DCU through relays within H hops. The result is a
-    minimal relay set; its plan is the BFS tree through the relays. The site with the smallest
-    MILP objective (R + eps * sum of hops) is returned.
-    """
-    t0 = time.perf_counter()
-    H = min(unit.N, ttl_max)
-    eps = 1.0 / (H * unit.N + 1)
-    adj = adjacency_matrix(unit)
-    order = sorted(range(unit.N), key=lambda j: (-unit.degree[j], j))
-    best = None
-    for k in (range(unit.C) if fixed_site is None else [fixed_site]):
-        relays = np.ones(unit.N, dtype=bool)
-        for j in order:
-            relays[j] = False
-            hops = reach_hops_fast(adj, unit.D[k], relays)
-            if (hops < 1).any() or hops.max() > H:
-                relays[j] = True
-        hops = reach_hops_fast(adj, unit.D[k], relays)
-        obj = unit.degree[relays].sum() + eps * hops.sum()
-        if best is None or obj < best[0] - 1e-12:
-            best = (obj, k, relays)
-    _, k, relays = best
-    return Plan("relay pruning", unit.uid, k, relays, relay_tree(unit, k, relays),
-                solve_time_s=time.perf_counter() - t0)
-
-
 def plan_to_vector(model: MilpModel, unit: PlanningUnit, plan: Plan) -> np.ndarray:
     """Encode a tree plan as a MILP point, with h = depth in the parent tree."""
     vec = np.zeros(model.n_cols)
@@ -1221,22 +1137,9 @@ def solve_milp(unit: PlanningUnit, fixed_site: int | None = None, *, api: str = 
     method = method or ("proposed" if fixed_site is None else "ablation")
     model = build_milp(unit, fixed_site)
 
-    # MIP start: the better (by objective) of the minimum-hop tree and the relay-pruning plan.
-    t_start = time.perf_counter()
-    starts = [min_hop_plan(unit) if fixed_site is None else tree_plan(unit, fixed_site, "minimum-hop tree")]
-    if WARM_START_PRUNING:
-        starts.append(pruned_relay_plan(unit, fixed_site))
-    feasible_starts = []
-    for cand in starts:
-        vec = plan_to_vector(model, unit, cand)
-        problems = check_point_feasible(model, vec)
-        if problems:
-            print(f"    WARNING: MIP start '{cand.method}' infeasible ({problems})")
-        else:
-            feasible_starts.append((float(model.cost @ vec), cand.method, vec))
-    if feasible_starts:
-        start_obj, start_name, start_vec = min(feasible_starts, key=lambda t: t[0])
-    start_time = time.perf_counter() - t_start
+    start = min_hop_plan(unit) if fixed_site is None else tree_plan(unit, fixed_site, "minimum-hop tree")
+    start_vec = plan_to_vector(model, unit, start)
+    start_problems = check_point_feasible(model, start_vec)
 
     h = highspy.Highs()
     h.setOptionValue("output_flag", bool(HIGHS_LOG))
@@ -1245,13 +1148,13 @@ def solve_milp(unit: PlanningUnit, fixed_site: int | None = None, *, api: str = 
     h.setOptionValue("mip_rel_gap", float(MIP_REL_GAP))
     h.setOptionValue("random_seed", int(RANDOM_SEED))
     load_model(h, model, api)
-    if feasible_starts:
+    if not start_problems:
         sol = highspy.HighsSolution()
         sol.col_value = start_vec.tolist()
         sol.value_valid = True
         h.setSolution(sol)
     else:
-        print("    WARNING: no feasible MIP start; solving without one")
+        print(f"    WARNING: MIP start infeasible ({start_problems}); solving without it")
 
     t0 = time.perf_counter()
     h.run()
@@ -1264,17 +1167,15 @@ def solve_milp(unit: PlanningUnit, fixed_site: int | None = None, *, api: str = 
         vec = np.asarray(h.getSolution().col_value, dtype=float)
         plan = extract_plan(model, unit, vec, method)
         plan.objective = float(info.objective_function_value)
-    elif feasible_starts:
+    elif not start_problems:
         print(f"    WARNING: HiGHS returned no solution ({status}); using the MIP start")
         plan = extract_plan(model, unit, start_vec, method)
-        plan.objective = start_obj
+        plan.objective = float(model.cost @ start_vec)
         plan.fallback = True
     else:
         raise RuntimeError(f"unit {unit.uid}: no solution found ({status})")
-    plan.solve_time_s = start_time + elapsed  # includes building the MIP starts
+    plan.solve_time_s = elapsed
     plan.status = status
-    if feasible_starts:
-        plan.start, plan.start_objective = start_name, start_obj
     plan.best_bound = float(info.mip_dual_bound)
     plan.gap = float(info.mip_gap)
     plan.primary_lb = float(math.floor(plan.best_bound + 1e-6)) if math.isfinite(plan.best_bound) else float("nan")
@@ -1551,8 +1452,7 @@ for site in sites.values():
         print(f"  unit {unit.uid + 1}/{len(site.units)}: N={unit.N}, C={unit.C} | "
               f"R min-hop {ev['minimum-hop']['redundant']}, all-relay {ev['all-relay']['redundant']}, "
               f"ablation {ev['ablation']['redundant']}, proposed {ev['proposed']['redundant']} "
-              f"(>= {p.primary_lb:g}) | proposed {p.status}, gap {p.gap:.2e}, {p.solve_time_s:.1f}s, "
-              f"start '{p.start}' R+eps*hops={p.start_objective:.2f} | "
+              f"(>= {p.primary_lb:g}) | proposed {p.status}, gap {p.gap:.2e}, {p.solve_time_s:.1f}s | "
               f"unit total {time.perf_counter() - t_unit:.1f}s")
 
 # %% [markdown]
@@ -1601,7 +1501,6 @@ def summarize(sites: dict[str, Site], results: dict) -> tuple[pd.DataFrame, pd.D
                 "pole distance (m)": float(np.linalg.norm(site.pole_xy[c_mh] - site.pole_xy[c_pr])),
                 "mean delta at min-hop pole": unit.delta[:, pm.site_k].mean(),
                 "mean delta at proposed pole": unit.delta[:, pp.site_k].mean(),
-                "proposed MIP start": pp.start,
                 "proposed status": pp.status,
                 "proposed R": pr_ev["redundant"], "proposed R lower bound": pp.primary_lb,
             })
