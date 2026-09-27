@@ -45,7 +45,8 @@ jupytext --to ipynb -o notebooks/dcu_relay_planning.ipynb src/dcu_relay_planning
 `notebooks/mesh_simulation.ipynb` is a discrete-event simulator (plain Python, `heapq`) of Bluetooth
 Mesh over the advertising bearer. It evaluates the plans in `<site>_plans.json`. Each meter sends a
 200-byte reading every interval as 18 SAR segments. The segments are flooded through the planned
-relays and acknowledged by the DCU. All transmissions of a site share the three advertising
+relays and acknowledged by the DCU, following the Mesh Protocol 1.1 SAR rules (SAR Transmitter and
+SAR Receiver states, including the retransmission counters with and without progress). All transmissions of a site share the three advertising
 channels, so they can collide. The notebook explains the model and every assumption, runs six
 deterministic validation tests and a reproducibility check before the main runs, and uses common
 random numbers across methods.
@@ -54,7 +55,11 @@ random numbers across methods.
 
 1. Upload the plan files to `/content/results/<site>_plans.json`.
 2. Edit the configuration cell if needed (for example `SITES`, `INTERVALS_MIN = [15, 5, 1]`, `N_RUNS`,
-   `OFFSET_MODE`, `COLLISION_MODEL`), then choose *Runtime → Run all*.
+   `OFFSET_MODE`, `COLLISION_MODEL`, `N_WORKERS`), then choose *Runtime → Run all*.
+
+The simulations run in `N_WORKERS` processes (default 2), shortest reporting interval first; each
+process takes the next simulation from the queue when it finishes one. Results are identical to a
+single-process run, which the notebook checks before the main runs.
 
 ## Outputs (`results/`)
 
