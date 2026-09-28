@@ -7,7 +7,8 @@ unit (DCU) of its planning unit. The reading is split into segments (SAR), each 
 through the relays chosen by the plan, and the DCU acknowledges the reading. All transmissions of a
 whole site share the three advertising channels, so they can collide.
 
-Three plans are compared per site: Proposed, Min-hop + min-relay and All-relay. The main metric is
+Three plans are compared per site: Joint (formerly "Proposed"), Sequential (formerly
+"Min-hop + min-relay") and All-relay. The main metric is
 the packet delivery ratio (PDR): the fraction of readings the DCU reassembles completely.
 
 Usage::
@@ -44,7 +45,9 @@ from pathlib import Path
 PLANS_DIR = Path("/workspace/sim_inputs")     # default: every <site>_plans.json in this folder
 INTERVALS_MIN = [1, 5, 10, 15]                # default reporting intervals (min)
 OUTPUT_ROOT = Path("/workspace/sim_results")  # outputs: OUTPUT_ROOT/<site>/, all intervals together
-METHODS: list[str] = ["Proposed", "Min-hop + min-relay", "All-relay"]  # order used in tables/plots
+METHODS: list[str] = ["Joint", "Sequential", "All-relay"]  # order used in tables/plots
+# Earlier names of the methods in plan files; a plan file may use either name.
+METHOD_ALIASES: dict[str, list[str]] = {"Joint": ["Proposed"], "Sequential": ["Min-hop + min-relay"]}
 
 # --- Traffic ----------------------------------------------------------------------
 OFFSET_MODE = "random"               # "random" (uniform first offset) or "synchronized" (worst case)
@@ -102,7 +105,20 @@ SAR_DISCARD_TIMEOUT_S = 10.0         # SAR Discard Timeout: (value + 1) x 5 s
 
 # --- Output ---------------------------------------------------------------------------
 LATEX_COLLISION_METRIC = "collisions_relay_dcu_per_reading"  # column shown as "Collisions" in LaTeX
-FIG_DPI = 200
+FIG_DPI = 300                        # only for raster elements; figures are vector PDF
+
+# --- Figures (IEEE) -----------------------------------------------------------------------------
+# Every figure is a PDF with the font embedded (TrueType, pdf.fonttype 42). The script stops before
+# simulating if FIG_FONT is not installed; list extra font files (e.g. a copied arial.ttf) in
+# FIG_FONT_FILES to register them.
+FIG_FONT = "Arial"
+FIG_FONT_FILES: list[str] = []       # e.g. ["~/.fonts/arial.ttf", "~/.fonts/arialbd.ttf"]
+IEEE_DOUBLE_COLUMN_IN = 7.16         # two-column figure width (43 picas)
+IEEE_SINGLE_COLUMN_IN = 3.5          # one-column figure width (21 picas)
+FS_AXIS_LABEL = 9                    # axis labels (IEEE: 9-10 pt)
+FS_TICK = 8                          # tick values (8-9 pt)
+FS_LEGEND = 8                        # legend (8-9 pt)
+FS_BAR_LABEL = 8                     # value labels on bars (8 pt)
 
 # --- Check of the number of runs -------------------------------------------------------------
 # For every pair of methods, the per-run difference of each metric below is averaged over the runs
@@ -511,9 +527,10 @@ def load_site_plans(path: Path, methods: list[str]) -> SitePlans:
 
     plans: dict[str, list[UnitPlan]] = {}
     for m in methods:
-        if m not in all_methods:
+        key = next((k for k in [m, *METHOD_ALIASES.get(m, [])] if k in all_methods), None)
+        if key is None:
             raise KeyError(f"{path.name}: method '{m}' missing (file has {list(all_methods)})")
-        mu = _require(all_methods[m], "units", f"method '{m}'", path)
+        mu = _require(all_methods[key], "units", f"method '{m}'", path)
         out = []
         for u in mu:
             where = f"method '{m}', unit entry"
@@ -1987,105 +2004,181 @@ def latex_table(summary: pd.DataFrame, interval: float, n_runs: int) -> str:
 
 # ### Plots
 #
-# PDR by method (error bars: 95 % confidence intervals), and per-meter PDR on the site map in local
-# coordinates only (no basemap). Colour = PDR of each meter over all runs; the darkest red is the
-# lowest PDR. Meters that share coordinates are drawn on top of each other, so the one plotted last is
-# visible. Thin lines are the planned parent links.
+# All figures are vector PDFs sized for an IEEE two-column (7.16 in) or one-column (3.5 in) layout,
+# with the font set by FIG_FONT embedded and IEEE font sizes. Error bars are 95 % confidence
+# intervals; the upper bar is drawn up to 100 % at most (a PDR cannot exceed 100 %). Figures have no
+# titles: the caption belongs in the paper. The per-meter maps use local coordinates only (no
+# basemap); colour = PDR of each meter over all runs (darkest red = lowest), thin lines are the
+# planned parent links, and meters that share coordinates are drawn on top of each other.
 
 METHOD_COLORS = dict(zip(METHODS, ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4"]))
-plt.rcParams.update({"axes.spines.top": False, "axes.spines.right": False, "axes.grid": True,
-                     "grid.color": "0.9", "grid.linewidth": 0.6, "axes.axisbelow": True})
-
-
 METHOD_MARKERS = dict(zip(METHODS, ["o", "s", "^", "D", "v"]))
 
 
-def plot_pdr_by_method(summary: pd.DataFrame, site: str, path: Path) -> None:
-    """Grouped bars: mean PDR per method for every interval, with 95 % CI error bars."""
-    intervals = sorted(summary["interval_min"].unique())
+def setup_figure_style() -> None:
+    """Register FIG_FONT_FILES, check that FIG_FONT is installed, and set the IEEE figure style."""
+    from matplotlib import font_manager
+    for f in FIG_FONT_FILES:
+        font_manager.fontManager.addfont(str(Path(f).expanduser()))
+    try:
+        path = font_manager.findfont(font_manager.FontProperties(family=FIG_FONT), fallback_to_default=False)
+    except ValueError:
+        raise SystemExit(
+            f"Font '{FIG_FONT}' is not installed, and the figures must embed it. Install it (e.g. copy "
+            f"arial.ttf, arialbd.ttf into ~/.fonts/ and run 'rm -rf ~/.cache/matplotlib'), or list the font "
+            f"files in FIG_FONT_FILES at the top of this script.") from None
+    print(f"Figure font: {FIG_FONT} ({path}), embedded as TrueType")
+    plt.rcParams.update({
+        "font.family": "sans-serif", "font.sans-serif": [FIG_FONT], "mathtext.fontset": "custom",
+        "mathtext.rm": FIG_FONT, "pdf.fonttype": 42, "ps.fonttype": 42,
+        "font.size": FS_TICK, "axes.labelsize": FS_AXIS_LABEL, "axes.titlesize": FS_AXIS_LABEL,
+        "xtick.labelsize": FS_TICK, "ytick.labelsize": FS_TICK, "legend.fontsize": FS_LEGEND,
+        "figure.titlesize": FS_AXIS_LABEL,
+        "axes.spines.top": False, "axes.spines.right": False, "axes.grid": True, "axes.grid.axis": "y",
+        "grid.color": "0.88", "grid.linewidth": 0.5, "axes.axisbelow": True, "axes.linewidth": 0.6,
+        "xtick.major.width": 0.6, "ytick.major.width": 0.6, "lines.linewidth": 1.2,
+        "savefig.dpi": FIG_DPI, "figure.constrained_layout.use": True,     # exact page size, no trimming
+        "figure.constrained_layout.h_pad": 0.02, "figure.constrained_layout.w_pad": 0.02,
+    })
+
+
+def _pdr_bars(ax: plt.Axes, summary: pd.DataFrame, intervals: list[float]) -> None:
+    """Grouped bars (one group per interval, one bar per method) with CI bars and value labels."""
     width = 0.8 / len(METHODS)
-    fig, ax = plt.subplots(figsize=(max(6.0, 2.2 * len(intervals) + 2), 4.6))
+    lows, tops = [], []
     for k, m in enumerate(METHODS):
         g = summary[summary.method == m].set_index("interval_min").reindex(intervals)
+        pdr = 100 * g["pdr"].to_numpy(dtype=float)
+        ci = 100 * g["pdr_ci95"].fillna(0).to_numpy(dtype=float)
+        upper = np.minimum(ci, 100 - pdr)
         x = np.arange(len(intervals)) + (k - (len(METHODS) - 1) / 2) * width
-        bars = ax.bar(x, 100 * g["pdr"], width * 0.92, yerr=100 * g["pdr_ci95"], capsize=3,
-                      color=METHOD_COLORS[m], label=m, error_kw={"elinewidth": 1, "ecolor": "0.25"})
-        for b, v, ci in zip(bars, 100 * g["pdr"], 100 * g["pdr_ci95"].fillna(0)):
-            ax.annotate(f"{v:.1f}", (b.get_x() + b.get_width() / 2, v + ci), xytext=(0, 3),
-                        textcoords="offset points", ha="center", va="bottom", fontsize=7, color="0.2")
+        ax.bar(x, pdr, width * 0.9, yerr=[ci, upper], capsize=2, color=METHOD_COLORS[m], label=m,
+               error_kw={"elinewidth": 0.7, "capthick": 0.7, "ecolor": "0.2"})
+        for xi, v, u in zip(x, pdr, upper):
+            ax.annotate(f"{v:.1f}", (xi, v + u), xytext=(0, 1.5), textcoords="offset points",
+                        ha="center", va="bottom", fontsize=FS_BAR_LABEL, color="0.15")
+        lows.append(np.nanmin(pdr - ci))
+        tops.append(np.nanmax(pdr + upper))
+    lo = max(0.0, np.floor(min(lows) - 2))
+    hi = max(tops)
+    ax.set_ylim(lo, hi + 0.14 * (hi - lo))             # headroom for the value labels
     ax.set_xticks(np.arange(len(intervals)), [f"{iv:g} min" for iv in intervals])
-    ax.set_ylim(max(0.0, 100 * np.nanmin(summary["pdr"] - summary["pdr_ci95"]) - 5),
-                max(101.0, 100 * np.nanmax(summary["pdr"] + summary["pdr_ci95"]) + 1.5))
     ax.set_ylabel("PDR (%)")
+    ax.tick_params(axis="x", length=0)
+
+
+def plot_pdr_by_method(summary: pd.DataFrame, path: Path) -> None:
+    """One site: PDR per method for every interval (two-column width)."""
+    intervals = sorted(summary["interval_min"].unique())
+    fig, ax = plt.subplots(figsize=(IEEE_DOUBLE_COLUMN_IN, 2.4))
+    _pdr_bars(ax, summary, intervals)
     ax.set_xlabel("Reporting interval")
-    ax.set_title(f"Site {site}: PDR by method ({OFFSET_MODE} offsets, {COLLISION_MODEL})", fontsize=10)
-    handles, labels = ax.get_legend_handles_labels()
-    fig.legend(handles, labels, loc="lower center", ncol=len(METHODS), frameon=False)
-    fig.tight_layout(rect=(0, 0.08, 1, 1))
-    fig.savefig(path, dpi=FIG_DPI)
+    fig.legend(*ax.get_legend_handles_labels(), loc="outside upper center", ncol=len(METHODS), frameon=False)
+    fig.savefig(path)
     plt.close(fig)
 
 
-def plot_vs_interval(summary: pd.DataFrame, site: str, path: Path) -> None:
-    """PDR and mean latency against the reporting interval, one line per method (95 % CI bars)."""
+def plot_pdr_all_sites(summary: pd.DataFrame, path: Path) -> None:
+    """All sites in one two-column figure: one panel per site (stacked), shared legend on top."""
+    sites = list(dict.fromkeys(summary["site"]))
     intervals = sorted(summary["interval_min"].unique())
-    fig, axes = plt.subplots(2, 1, figsize=(6, 7.5), sharex=True)
+    fig, axes = plt.subplots(len(sites), 1, figsize=(IEEE_DOUBLE_COLUMN_IN, 0.45 + 1.95 * len(sites)),
+                             sharex=True, squeeze=False)
+    for ax, site in zip(axes[:, 0], sites):
+        _pdr_bars(ax, summary[summary.site == site], intervals)
+        ax.set_title(f"({chr(97 + sites.index(site))}) {site}", loc="left", pad=2)
+    axes[-1, 0].set_xlabel("Reporting interval")
+    fig.legend(*axes[0, 0].get_legend_handles_labels(), loc="outside upper center", ncol=len(METHODS),
+               frameon=False)
+    fig.savefig(path)
+    plt.close(fig)
+
+
+def plot_vs_interval(summary: pd.DataFrame, path: Path) -> None:
+    """PDR and mean latency against the reporting interval, one line per method (one-column width)."""
+    intervals = sorted(summary["interval_min"].unique())
+    fig, axes = plt.subplots(2, 1, figsize=(IEEE_SINGLE_COLUMN_IN, 3.9), sharex=True)
     for m in METHODS:
         g = summary[summary.method == m].sort_values("interval_min")
-        kw = dict(color=METHOD_COLORS[m], marker=METHOD_MARKERS[m], lw=2, ms=7, capsize=3, label=m)
-        axes[0].errorbar(g["interval_min"], 100 * g["pdr"], yerr=100 * g["pdr_ci95"], **kw)
+        kw = dict(color=METHOD_COLORS[m], marker=METHOD_MARKERS[m], ms=4, capsize=2, elinewidth=0.7, label=m)
+        pdr, ci = 100 * g["pdr"], 100 * g["pdr_ci95"]
+        axes[0].errorbar(g["interval_min"], pdr, yerr=[ci, np.minimum(ci, 100 - pdr)], **kw)
         axes[1].errorbar(g["interval_min"], g["latency_mean_ms"], yerr=g["latency_mean_ms_ci95"], **kw)
     for ax in axes:
         ax.set_xscale("log")
         ax.set_xticks(intervals, [f"{iv:g}" for iv in intervals])
         ax.minorticks_off()
-    axes[0].set_title(f"Site {site}")
+        ax.grid(True, axis="both")
     axes[0].set_ylabel("PDR (%)")
     axes[1].set_ylabel("Mean latency (ms)")
-    axes[1].set_xlabel("Reporting interval (min, log scale)")
-    axes[0].legend(frameon=False)
-    fig.tight_layout()
-    fig.savefig(path, dpi=FIG_DPI)
+    axes[1].set_xlabel("Reporting interval (min)")
+    fig.legend(*axes[0].get_legend_handles_labels(), loc="outside upper center", ncol=len(METHODS),
+               frameon=False, handletextpad=0.3, columnspacing=0.8)
+    fig.savefig(path)
     plt.close(fig)
 
 
-def plot_per_meter_map(sp: SitePlans, per_meter: pd.DataFrame, interval: int, n_runs: int, path: Path) -> None:
-    """Per-meter PDR of every method on the site map (local coordinates)."""
+def plot_per_meter_map(sp: SitePlans, per_meter: pd.DataFrame, path: Path) -> None:
+    """Per-meter PDR of every method on the site map (local coordinates, two-column width).
+
+    The panels are placed explicitly (equal-aspect maps): their height follows the site's shape.
+    """
     mxy = dict(zip(sp.meter_ids, sp.meter_xy))
     pxy = dict(zip(sp.pole_ids, sp.pole_xy))
     vmin = min(0.9, float(per_meter["pdr"].min()))
-    fig, axes = plt.subplots(1, len(METHODS), figsize=(6 * len(METHODS), 6), sharex=True, sharey=True, squeeze=False)
+    pts = np.vstack([sp.meter_xy, sp.pole_xy])
+    (x0, y0), (x1, y1) = pts.min(axis=0), pts.max(axis=0)
+    pad = 0.04 * max(x1 - x0, y1 - y0, 1.0)
+    x0, x1, y0, y1 = x0 - pad, x1 + pad, y0 - pad, y1 + pad
+    n = len(METHODS)
+    left, gap, right, top, bottom = 0.5, 0.12, 0.75, 0.42, 0.72          # inches
+    panel_w = (IEEE_DOUBLE_COLUMN_IN - left - right - (n - 1) * gap) / n
+    panel_h = float(np.clip(panel_w * (y1 - y0) / (x1 - x0), 0.8, 4.5))
+    fig_w, fig_h = IEEE_DOUBLE_COLUMN_IN, top + panel_h + bottom
+    fig = plt.figure(figsize=(fig_w, fig_h), layout="none")
     sc_ = None
-    for ax, m in zip(axes[0], METHODS):
+    axes = []
+    for k, m in enumerate(METHODS):
+        ax = fig.add_axes([(left + k * (panel_w + gap)) / fig_w, bottom / fig_h, panel_w / fig_w, panel_h / fig_h],
+                          sharex=axes[0] if axes else None, sharey=axes[0] if axes else None)
+        axes.append(ax)
         ups = sp.methods[m]
         segs = [[mxy[mid], pxy[par] if is_dcu else mxy[par]]
                 for up in ups for mid, (par, is_dcu) in up.meter_parent.items()]
-        ax.add_collection(LineCollection(segs, colors="0.75", linewidths=0.6, zorder=1))
-        ax.scatter(*sp.pole_xy.T, marker="s", s=12, facecolors="none", edgecolors="0.7", linewidths=0.5, zorder=2)
+        ax.add_collection(LineCollection(segs, colors="0.75", linewidths=0.4, zorder=1))
+        ax.scatter(*sp.pole_xy.T, marker="s", s=5, facecolors="none", edgecolors="0.65", linewidths=0.4, zorder=2)
         g = per_meter[per_meter.method == m].set_index("meter_id")
         ids = [i for i in sp.meter_ids if i in g.index]
         xy = np.array([mxy[i] for i in ids])
         relays = {r for up in ups for r in up.relay_ids}
-        sc_ = ax.scatter(*xy.T, c=g.loc[ids, "pdr"], cmap=plt.get_cmap("Reds_r"), vmin=vmin, vmax=1.0, s=42,
+        sc_ = ax.scatter(*xy.T, c=g.loc[ids, "pdr"], cmap=plt.get_cmap("Reds_r"), vmin=vmin, vmax=1.0, s=12,
                          edgecolors=["k" if i in relays else "0.5" for i in ids],
-                         linewidths=[1.6 if i in relays else 0.4 for i in ids], zorder=3)
-        ax.scatter(*np.array([pxy[up.dcu_pole] for up in ups]).T, marker="*", s=300, c="#eda100",
-                   edgecolors="k", zorder=4)
+                         linewidths=[0.9 if i in relays else 0.3 for i in ids], zorder=3)
+        ax.scatter(*np.array([pxy[up.dcu_pole] for up in ups]).T, marker="*", s=70, c="#eda100",
+                   edgecolors="k", linewidths=0.5, zorder=4)
         mean_pdr = g["n_delivered"].sum() / g["n_readings"].sum()
-        ax.set_title(f"{m}: {len(relays)} relays, PDR {100 * mean_pdr:.2f} %", fontsize=10)
-        ax.set_aspect("equal")
-        ax.set_xlabel("x (m, local)")
-    axes[0][0].set_ylabel("y (m, local)")
-    fig.subplots_adjust(left=0.05, right=0.9, bottom=0.14, top=0.9, wspace=0.12)
-    fig.colorbar(sc_, cax=fig.add_axes([0.92, 0.2, 0.012, 0.62]), label="per-meter PDR")
-    handles = [Line2D([], [], marker="*", ls="", ms=14, mfc="#eda100", mec="k", label="DCU"),
-               Line2D([], [], marker="o", ls="", mfc="w", mec="k", mew=1.6, label="relay meter"),
-               Line2D([], [], marker="o", ls="", mfc="w", mec="0.5", label="non-relay meter"),
-               Line2D([], [], marker="s", ls="", mfc="none", mec="0.7", label="pole"),
-               Line2D([], [], c="0.75", label="planned parent link")]
-    fig.legend(handles=handles, loc="lower center", ncol=5, frameon=False)
-    fig.suptitle(f"Site {sp.name}: per-meter PDR, {interval} min interval ({n_runs} runs)")
-    fig.savefig(path, dpi=FIG_DPI, bbox_inches="tight")
+        ax.set_title(f"{m}\n{len(relays)} relay{'s' if len(relays) != 1 else ''}, PDR {100 * mean_pdr:.1f} %", pad=3)
+        ax.set_xlim(x0, x1)
+        ax.set_ylim(y0, y1)
+        ax.set_aspect("equal", adjustable="box")
+        ax.grid(False)
+        ax.set_xlabel("x (m)", labelpad=1)
+        if k:
+            ax.tick_params(labelleft=False)
+    axes[0].set_ylabel("y (m)")
+    cax = fig.add_axes([(fig_w - right + 0.1) / fig_w, (bottom + 0.1 * panel_h) / fig_h, 0.08 / fig_w,
+                        0.8 * panel_h / fig_h])
+    cb = fig.colorbar(sc_, cax=cax)
+    cb.set_label("Per-meter PDR")
+    cb.outline.set_linewidth(0.5)
+    handles = [Line2D([], [], marker="*", ls="", ms=7, mfc="#eda100", mec="k", mew=0.5, label="DCU"),
+               Line2D([], [], marker="o", ls="", ms=4, mfc="w", mec="k", mew=0.9, label="Relay meter"),
+               Line2D([], [], marker="o", ls="", ms=4, mfc="w", mec="0.5", mew=0.3, label="Non-relay meter"),
+               Line2D([], [], marker="s", ls="", ms=3, mfc="none", mec="0.65", mew=0.4, label="Pole"),
+               Line2D([], [], c="0.75", lw=0.6, label="Planned parent link")]
+    fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(0.5, 0.0), ncol=5, frameon=False,
+               handletextpad=0.3, columnspacing=1.0, borderaxespad=0.1)
+    fig.savefig(path)
     plt.close(fig)
 
 
@@ -2095,7 +2188,6 @@ def write_results(su: "SiteUniverse", n_runs: int, runs: pd.DataFrame,
 
     ``runs`` holds every interval simulated so far; each file covers all of them. Returns the summary.
     """
-    site = su.plans.name
     intervals = sorted(runs["interval_min"].unique())
     summary = summarize(runs)
     summary.to_csv(out / "sim_summary.csv", index=False)
@@ -2121,12 +2213,12 @@ def write_results(su: "SiteUniverse", n_runs: int, runs: pd.DataFrame,
     print(worst.sort_values(["interval_min", "method", "pdr"])
           [["interval_min", "method", "meter_id", "n_readings", "n_delivered", "pdr"]].to_string(index=False))
 
-    plot_pdr_by_method(summary, site, out / "figures" / "pdr_by_method.png")
+    plot_pdr_by_method(summary, out / "figures" / "pdr_by_method.pdf")
     if len(intervals) > 1:
-        plot_vs_interval(summary, site, out / "figures" / "pdr_latency_vs_interval.png")
+        plot_vs_interval(summary, out / "figures" / "pdr_latency_vs_interval.pdf")
     for iv in intervals:
-        plot_per_meter_map(su.plans, per_meter[per_meter.interval_min == iv], int(iv), n_runs,
-                           out / "figures" / f"per_meter_pdr_{iv:g}min.png")
+        plot_per_meter_map(su.plans, per_meter[per_meter.interval_min == iv],
+                           out / "figures" / f"per_meter_pdr_{iv:g}min.pdf")
     print(f"\nSaved in {out} (intervals {[int(i) for i in intervals]} min): sim_runs.csv, sim_per_meter_runs.csv, "
           f"sim_summary.csv, sim_run_adequacy.csv, sim_table.tex, sim_per_meter.csv, sim_metadata.json, figures/")
     return summary
@@ -2201,6 +2293,7 @@ def main(argv: list[str] | None = None) -> None:
     """Every <site>_plans.json in the plans folder, every interval."""
     args = parse_args(argv)
     t_start = time.perf_counter()
+    setup_figure_style()                  # fails before any simulation if the font is missing
     paths = sorted(args.plans_dir.glob("*_plans.json"))
     if not paths:
         raise SystemExit(f"No '*_plans.json' in {args.plans_dir.resolve()}.")
@@ -2220,6 +2313,9 @@ def main(argv: list[str] | None = None) -> None:
                              initargs=([str(p.resolve()) for p in paths],)) as pool:
         for su in universes:
             summaries.append(run_site(pool, su, intervals, args))
+            combined = args.out_root / "pdr_by_method_all_sites.pdf"
+            plot_pdr_all_sites(pd.concat(summaries, ignore_index=True), combined)
+            print(f"Saved {combined} ({len(summaries)} site(s))")
 
     print("\n=== All sites: PDR (%), mean latency (ms), collisions at relays and DCUs per reading "
           "(mean ± 95 % CI) ===")

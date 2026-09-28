@@ -94,7 +94,23 @@ rewritten after every simulation.
 | `sim_table.tex` | One LaTeX `tabular` (Site, Method, PDR, Collisions, Latency) per interval |
 | `sim_per_meter_runs.csv`, `sim_per_meter.csv` | Per-meter delivered readings, per run and pooled |
 | `sim_metadata.json` | Arguments, configuration and package versions |
-| `figures/` | `pdr_by_method.png` (all intervals), `pdr_latency_vs_interval.png`, `per_meter_pdr_<interval>min.png` (local coordinates) |
+| `figures/` | `pdr_by_method.pdf` (all intervals), `pdr_latency_vs_interval.pdf`, `per_meter_pdr_<interval>min.pdf` (local coordinates) |
+
+In addition, `/workspace/sim_results/pdr_by_method_all_sites.pdf` shows the PDR bar charts of all
+sites in one two-column figure (one panel per site), updated after each site.
+
+### Figures
+
+All figures are vector PDFs for an IEEE paper: two-column width 7.16 in (43 picas) or one-column
+width 3.5 in, Arial embedded as TrueType, axis labels 9 pt, tick values, legends and bar labels 8 pt,
+no titles (the caption goes in the paper). Error bars are 95 % confidence intervals, drawn up to 100 %
+at most. The methods are labelled **Joint** (formerly "Proposed"), **Sequential** (formerly
+"Min-hop + min-relay") and **All-relay**; plan files may use either the new or the old names.
+
+**Arial must be installed**, because the figures embed it; the script checks this before simulating
+and stops with instructions if it is missing. On Linux, copy `arial.ttf` (and `arialbd.ttf`) to
+`~/.fonts/` and clear the matplotlib cache (`rm -rf ~/.cache/matplotlib`), or list the font files in
+`FIG_FONT_FILES` at the top of the script.
 
 `notebooks/mesh_simulation.ipynb` is the earlier notebook version of the simulator. It is no longer
 updated; use the script.
