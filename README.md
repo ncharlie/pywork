@@ -32,7 +32,8 @@ To try the notebook without data, set `GENERATE_DEMO_SITE = True`.
 | `planning_summary.csv` | Per site and method: DCUs, relays, redundant rebroadcasts, tree and flooding hops, solve time, MILP status and gap |
 | `unit_site_comparison.csv` | Per planning unit: Proposed pole vs minimum-hop pole and their distance, and whether Proposed and Min-hop + min-relay select the same relays |
 | `planning_summary.tex` | LaTeX `tabular` of the summary |
-| `<site>_plans.png` | Min-hop + min-relay plan next to the Proposed plan |
+| `planning_plans.pdf` | IEEE two-column figure (7.16 in wide, Arial embedded): per site, Min-hop + min-relay next to Proposed, with parent links |
+| `planning_coverage.pdf` | Same layout without links; transparent d_max circles around the DCU (yellow) and relays (pink) |
 | `<site>_plans.json` | Parameters, local coordinates, planning units and each method's plan (DCU, relays, parents, TTL per meter), read by the simulation notebook |
 
 ## Source

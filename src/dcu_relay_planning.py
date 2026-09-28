@@ -78,6 +78,13 @@ TTL_MAX = 127                       # Bluetooth Mesh maximum TTL; caps the hop c
 RANDOM_SEED = 20240501              # Gurobi Seed, numpy and random
 SOLVER_LOG = False                  # True = show the Gurobi solver log
 REQUIRE_GUROBI_WLS = True           # stop if the academic WLS license credentials are not found
+GUROBI_THREADS = 32                 # Gurobi Threads parameter, set on the environment
+
+# --- Paper figures (IEEE) -----------------------------------------------------------
+FIG_WIDTH_IN = 7.16                 # IEEE two-column width (43 picas)
+FIG_ROW_HEIGHT_IN = 2.0             # height of one site row (two panels)
+ARIAL_FONT_PATH: str | None = None  # path to an arial.ttf file, if Arial is not installed
+SITE_LABELS: dict[str, str] = {}    # optional row labels, e.g. {"site_a": "Site A"}
 
 # --- Verification -----------------------------------------------------------------
 BRUTE_FORCE_MAX_METERS = 12         # size of the instances checked by exhaustive search
@@ -193,6 +200,7 @@ def start_gurobi_env(require_wls: bool) -> tuple[gp.Env, str]:
             "or set REQUIRE_GUROBI_WLS = False to use a local gurobi.lic / the size-limited license.")
     env = gp.Env(empty=True)
     env.setParam("OutputFlag", 0)
+    env.setParam("Threads", GUROBI_THREADS)
     if creds:
         env.setParam("WLSACCESSID", creds["WLSACCESSID"])
         env.setParam("WLSSECRET", creds["WLSSECRET"])
@@ -903,8 +911,8 @@ for site in sites.values():
 # Gurobi receives a **MIP start** (see 2.3). Before it is passed to Gurobi, the start vector is
 # checked against every row, bound and integrality requirement.
 #
-# Solver settings: `TimeLimit = TIME_LIMIT_S`, `MIPGap = MIP_REL_GAP`, `Seed = RANDOM_SEED`; all
-# other Gurobi parameters keep their defaults. Gurobi is deterministic for a fixed seed, thread
+# Solver settings: `TimeLimit = TIME_LIMIT_S`, `MIPGap = MIP_REL_GAP`, `Seed = RANDOM_SEED`, and
+# `Threads = GUROBI_THREADS` on the environment; all other Gurobi parameters keep their defaults. Gurobi is deterministic for a fixed seed, thread
 # count and machine; a run stopped by the time limit can differ between machines.
 
 # %%
@@ -1655,53 +1663,208 @@ latex = latex_table(summary)
 (RESULTS_DIR / "planning_summary.tex").write_text(latex + "\n")
 print(latex)
 
+# %% [markdown]
+# ### Paper figures (IEEE)
+#
+# Two PDF figures combine all sites, one row per site, with **Min-hop + min-relay** (left) next to
+# **Proposed** (right):
+#
+# * `results/planning_plans.pdf`: meters, candidate poles, DCU, relays and parent links;
+# * `results/planning_coverage.pdf`: the same nodes without links, with a circle of radius
+#   $d_\text{max}$ around the DCU (yellow, transparent) and around every relay (pink, transparent).
+#
+# Each panel title gives the method, $R$ = redundant rebroadcasts $\sum_j |A(j)|\, r_j$, and the
+# mean / max tree hops; the legend title repeats these definitions. The figures follow IEEE
+# two-column width (`FIG_WIDTH_IN` = 7.16 in = 43 picas); all panels have the same size and a 1:1
+# scale in metres. Fonts are Arial, embedded in the PDF as TrueType (`pdf.fonttype = 42`): axis
+# labels 9 pt, tick values 8 pt, legend 8 pt, panel titles 8 pt. If Arial is not installed, the
+# notebook installs the Microsoft core fonts (Colab/Debian) or uses `ARIAL_FONT_PATH`; if that is
+# impossible it falls back to Liberation Sans (metrically identical to Arial) and prints a warning.
+
 # %%
-def plot_plan(site: Site, method: str, ax: plt.Axes) -> None:
-    """Plot one method's plan for a site: meters, poles, DCUs, relays and parent links."""
-    ax.scatter(*site.pole_xy.T, marker="s", s=14, facecolors="none", edgecolors="0.6", linewidths=0.5)
-    segs, dcus, relays, others = [], [], [], []
+import glob
+import re
+import shutil
+import subprocess
+
+from matplotlib import font_manager
+from matplotlib.patches import Circle, Patch
+
+
+def find_arial(extra_path: str | None) -> str | None:
+    """Register an Arial TrueType file with matplotlib and return its family name, or None."""
+    paths = ([extra_path] if extra_path else []) + sorted(
+        glob.glob("/usr/share/fonts/**/[Aa]rial.ttf", recursive=True))
+    for path in paths:
+        if Path(path).is_file():
+            font_manager.fontManager.addfont(path)
+            return font_manager.FontProperties(fname=path).get_name()
+    if any(f.name == "Arial" for f in font_manager.fontManager.ttflist):
+        return "Arial"
+    return None
+
+
+def setup_paper_font(extra_path: str | None) -> str:
+    """Make Arial available (installing it on Debian/Colab if needed); return the font family used."""
+    name = find_arial(extra_path)
+    if name is None and shutil.which("apt-get"):
+        print("Arial not found: installing ttf-mscorefonts-installer (Microsoft core fonts) ...")
+        subprocess.run("echo ttf-mscorefonts-installer msttcorefonts/accepted-mscorefonts-eula select true "
+                       "| debconf-set-selections && apt-get -qq update && "
+                       "apt-get -qq install -y ttf-mscorefonts-installer",
+                       shell=True, capture_output=True)
+        name = find_arial(extra_path)
+    if name is None:
+        name = "Liberation Sans" if any(f.name == "Liberation Sans" for f in font_manager.fontManager.ttflist) \
+            else "DejaVu Sans"
+        print(f"WARNING: Arial is NOT available; the figures use {name}. "
+              "Set ARIAL_FONT_PATH to an arial.ttf file to use Arial.")
+    return name
+
+
+PAPER_FONT = setup_paper_font(ARIAL_FONT_PATH)
+PAPER_RC = {
+    "font.family": "sans-serif", "font.sans-serif": [PAPER_FONT], "font.size": 8,
+    "pdf.fonttype": 42, "ps.fonttype": 42,              # embed TrueType fonts (IEEE PDF eXpress)
+    "axes.labelsize": 9, "xtick.labelsize": 8, "ytick.labelsize": 8,
+    "legend.fontsize": 8, "legend.title_fontsize": 8, "axes.titlesize": 8,
+    "axes.linewidth": 0.5, "xtick.major.width": 0.5, "ytick.major.width": 0.5,
+    "xtick.major.size": 2.5, "ytick.major.size": 2.5, "axes.edgecolor": "0.3",
+    "xtick.color": "0.2", "ytick.color": "0.2", "axes.labelcolor": "0.1", "text.color": "0.1",
+}
+DCU_FILL = (1.0, 0.85, 0.0, 0.30)      # yellow, transparent
+RELAY_FILL = (1.0, 0.41, 0.71, 0.15)   # pink, transparent
+
+
+def plan_extent(site: Site, methods: tuple[str, ...], margin_m: float) -> tuple[np.ndarray, np.ndarray]:
+    """Bounding box of a site's planned meters and DCUs (all given methods), plus a margin."""
+    pts = [site.meter_xy[np.concatenate([u.meters for u in site.units])]]
+    for m in methods:
+        pts += [site.pole_xy[site.units[p.uid].candidates[p.site_k]][None] for p, _ in results[site.name][m]]
+    pts = np.vstack(pts)
+    return pts.min(axis=0) - margin_m, pts.max(axis=0) + margin_m
+
+
+def draw_plan_panel(site: Site, method: str, ax: plt.Axes, style: str) -> None:
+    """Draw one method's plan of one site; style 'links' (parent links) or 'coverage' (d_max circles)."""
+    ax.scatter(*site.pole_xy.T, marker="s", s=5, facecolors="none", edgecolors="0.65", linewidths=0.4, zorder=2)
+    segs, dcus, relay_xy, other_xy = [], [], [], []
     for plan, _ in results[site.name][method]:
         unit = site.units[plan.uid]
         pole = site.pole_xy[unit.candidates[plan.site_k]]
         dcus.append(pole)
         for i, p in enumerate(plan.parent):
-            a = site.meter_xy[unit.meters[i]]
-            segs.append([a, pole if p < 0 else site.meter_xy[unit.meters[p]]])
-        relays.append(site.meter_xy[unit.meters[plan.relays]])
-        others.append(site.meter_xy[unit.meters[~plan.relays]])
-    ax.add_collection(LineCollection(segs, colors="tab:blue", linewidths=0.7, alpha=0.7))
-    ax.scatter(*np.vstack(others).T, s=8, c="0.35", zorder=3)
-    if sum(len(r) for r in relays):
-        ax.scatter(*np.vstack(relays).T, s=26, c="tab:red", zorder=4)
-    ax.scatter(*np.array(dcus).T, marker="*", s=260, c="gold", edgecolors="k", zorder=5)
+            segs.append([site.meter_xy[unit.meters[i]], pole if p < 0 else site.meter_xy[unit.meters[p]]])
+        relay_xy.append(site.meter_xy[unit.meters[plan.relays]])
+        other_xy.append(site.meter_xy[unit.meters[~plan.relays]])
+    relay_xy, other_xy, dcus = np.vstack(relay_xy), np.vstack(other_xy), np.array(dcus)
+    if style == "links":
+        ax.add_collection(LineCollection(segs, colors="tab:blue", linewidths=0.45, alpha=0.8, zorder=1))
+    elif style == "coverage":
+        for xy in relay_xy:
+            ax.add_patch(Circle(xy, site.d_max, facecolor=RELAY_FILL, edgecolor="none", zorder=0))
+        for xy in dcus:
+            ax.add_patch(Circle(xy, site.d_max, facecolor=DCU_FILL, edgecolor="none", zorder=0))
+    else:
+        raise ValueError(f"unknown style '{style}'")
+    if len(other_xy):
+        ax.scatter(*other_xy.T, s=3, c="0.35", linewidths=0, zorder=3)
+    if len(relay_xy):
+        ax.scatter(*relay_xy.T, s=9, c="tab:red", linewidths=0, zorder=4)
+    ax.scatter(*dcus.T, marker="*", s=70, c="gold", edgecolors="k", linewidths=0.5, zorder=5)
     row = summary[(summary.site == site.name) & (summary.method == method)].iloc[0]
-    ax.set_title(f"{method}: {row['relays']} relays, R = {row['redundant rebroadcasts']}, "
-                 f"hops {row['mean tree hops']:.2f} / {row['max tree hops']}", fontsize=10)
-    # Zoom to the planned meters (uncovered meters far away would squash the plot).
-    planned = np.vstack([site.meter_xy[np.concatenate([u.meters for u in site.units])], np.array(dcus)])
-    lo, hi = planned.min(axis=0) - 30, planned.max(axis=0) + 30
-    ax.set_xlim(lo[0], hi[0])
-    ax.set_ylim(lo[1], hi[1])
-    ax.set_aspect("equal")
-    ax.set_xlabel("x (m)")
+    ax.set_title(f"{method}: R = {row['redundant rebroadcasts']}, "
+                 f"hops = {row['mean tree hops']:.2f} / {row['max tree hops']}", pad=3)
 
 
-legend = [Line2D([], [], marker="*", ls="", ms=14, mfc="gold", mec="k", label="DCU"),
-          Line2D([], [], marker="o", ls="", c="tab:red", label="relay"),
-          Line2D([], [], marker="o", ls="", ms=4, c="0.35", label="non-relay meter"),
-          Line2D([], [], marker="s", ls="", mfc="none", c="0.6", label="pole"),
-          Line2D([], [], c="tab:blue", label="parent link")]
-for site in sites.values():
-    if not site.units:
-        continue
-    fig, axes = plt.subplots(1, 2, figsize=(15, 7), sharex=True, sharey=True)
-    for ax, m in zip(axes, (MIN_RELAY, PROPOSED)):
-        plot_plan(site, m, ax)
-    axes[0].set_ylabel("y (m)")
-    fig.legend(handles=legend, loc="lower center", ncol=5)
-    fig.suptitle(f"Site {site.name}" + (f" ({len(site.uncovered)} uncovered meters not shown)" if len(site.uncovered) else ""))
-    fig.tight_layout(rect=(0, 0.05, 1, 1))
-    fig.savefig(RESULTS_DIR / f"{site.name}_plans.png", dpi=200)
+def paper_figure(style: str, methods: tuple[str, str] = (MIN_RELAY, PROPOSED)) -> plt.Figure:
+    """All sites in one IEEE two-column figure: one row per site, one column per method."""
+    names = [n for n, s in sites.items() if s.units]
+    with plt.rc_context(PAPER_RC):
+        fig, axes = plt.subplots(len(names), 2, figsize=(FIG_WIDTH_IN, len(names) * FIG_ROW_HEIGHT_IN + 0.55),
+                                 layout="constrained", squeeze=False)
+        extents = {}
+        for r, name in enumerate(names):
+            site = sites[name]
+            lo, hi = plan_extent(site, methods, site.d_max if style == "coverage" else 15.0)
+            for c, m in enumerate(methods):
+                ax = axes[r, c]
+                extents[ax] = (lo, hi)
+                draw_plan_panel(site, m, ax, style)
+                ax.set_xlim(lo[0], hi[0])
+                ax.set_ylim(lo[1], hi[1])
+                ax.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(5))
+                ax.yaxis.set_major_locator(matplotlib.ticker.MaxNLocator(4))
+                if c == 0:
+                    ax.set_ylabel(f"{SITE_LABELS.get(name, name)}\ny (m)")
+                else:
+                    ax.tick_params(labelleft=False)
+                if r == len(names) - 1:
+                    ax.set_xlabel("x (m)")
+        handles = [Line2D([], [], marker="*", ls="", ms=8, mfc="gold", mec="k", mew=0.5, label="DCU"),
+                   Line2D([], [], marker="o", ls="", ms=3.5, mfc="tab:red", mec="none", label="relay"),
+                   Line2D([], [], marker="o", ls="", ms=2.2, mfc="0.35", mec="none", label="non-relay meter"),
+                   Line2D([], [], marker="s", ls="", ms=3, mfc="none", mec="0.65", mew=0.5, label="candidate pole")]
+        if style == "links":
+            handles.append(Line2D([], [], c="tab:blue", lw=0.8, label="parent link"))
+        else:
+            d = f"{sites[names[0]].d_max:.1f} m"
+            handles += [Patch(facecolor=DCU_FILL, edgecolor="none", label=f"DCU range ({d})"),
+                        Patch(facecolor=RELAY_FILL, edgecolor="none", label=f"relay range ({d})")]
+        n_uncovered = sum(len(sites[n].uncovered) for n in names)
+        title = "R: redundant rebroadcasts; hops: mean / max tree hops to the DCU"
+        if n_uncovered:
+            title += f"; {n_uncovered} uncovered meter{'s' if n_uncovered > 1 else ''} not shown"
+        fig.legend(handles=handles, loc="outside lower center", ncols=len(handles), title=title,
+                   frameon=False, handletextpad=0.3, columnspacing=1.2)
+        # Freeze the constrained layout (all panels the same size), then widen each panel's limits
+        # to the panel's width/height ratio so that 1 m in x equals 1 m in y.
+        fig.canvas.draw()
+        fig.set_layout_engine("none")
+        fig_w, fig_h = fig.get_size_inches()
+        for ax, (lo, hi) in extents.items():
+            pos = ax.get_position()
+            box_w, box_h = pos.width * fig_w, pos.height * fig_h
+            m_per_in = max((hi[0] - lo[0]) / box_w, (hi[1] - lo[1]) / box_h)
+            cx, cy = (lo + hi) / 2
+            ax.set_xlim(cx - m_per_in * box_w / 2, cx + m_per_in * box_w / 2)
+            ax.set_ylim(cy - m_per_in * box_h / 2, cy + m_per_in * box_h / 2)
+            ax.set_aspect("equal", adjustable="box")
+    return fig
+
+
+def check_panel_sizes(fig: plt.Figure) -> tuple[float, float]:
+    """Assert that all panels have the same size and a 1:1 scale; return (width, height) in inches."""
+    fig.canvas.draw()
+    w, h = fig.get_size_inches()
+    sizes = np.array([[ax.get_position().width * w, ax.get_position().height * h] for ax in fig.axes])
+    assert np.allclose(sizes, sizes[0], atol=1e-3), f"panel sizes differ: {sizes}"
+    for ax in fig.axes:
+        pos = ax.get_position()
+        sx = (ax.get_xlim()[1] - ax.get_xlim()[0]) / (pos.width * w)
+        sy = (ax.get_ylim()[1] - ax.get_ylim()[0]) / (pos.height * h)
+        assert abs(sx - sy) < 1e-6 * sx, "x and y scales differ"
+    return float(sizes[0, 0]), float(sizes[0, 1])
+
+
+def embedded_fonts(pdf_path: Path) -> list[str]:
+    """Names of the fonts embedded as TrueType (FontFile2) in a matplotlib PDF."""
+    data = pdf_path.read_bytes()
+    names = sorted(set(m.decode() for m in re.findall(rb"/BaseFont\s*/([A-Za-z0-9+\-]+)", data)))
+    return names if b"/FontFile2" in data else []
+
+
+for style, fname in (("links", "planning_plans.pdf"), ("coverage", "planning_coverage.pdf")):
+    if not any(s.units for s in sites.values()):
+        break
+    fig = paper_figure(style)
+    panel_w, panel_h = check_panel_sizes(fig)
+    out = RESULTS_DIR / fname
+    with plt.rc_context(PAPER_RC):
+        fig.savefig(out, format="pdf")
+    w, h = fig.get_size_inches()
+    print(f"Saved {out}: {w:.2f} x {h:.2f} in, {len(fig.axes)} panels of {panel_w:.2f} x {panel_h:.2f} in, "
+          f"embedded fonts: {', '.join(embedded_fonts(out)) or 'NONE'}")
     plt.show()
 
 # %% [markdown]
