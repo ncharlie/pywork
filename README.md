@@ -61,16 +61,16 @@ Put the plan files in `/workspace/sim_inputs/` and run
 python ./src/mesh_simulation.py
 ```
 
-This simulates every `<site>_plans.json` in that folder for the reporting intervals 1, 5, 10 and
+This simulates every `<site>_plans.json` in that folder for the reporting intervals 1, 2, 4, 8 and
 15 min, 100 Monte Carlo runs each, with every simulation spread over one pool of worker processes.
 All options are optional:
 
 | Option | Default |
 |---|---|
 | `--plans-dir` | `/workspace/sim_inputs` (only files directly in it) |
-| `--intervals` | `1 5 10 15` (minutes) |
+| `--intervals` | `1 2 4 8 15` (minutes) |
 | `--runs` | 100 Monte Carlo runs per site and interval |
-| `--workers` | every CPU; the simulations (runs x methods) are spread over these processes |
+| `--workers` | 32; the simulations (runs x methods) are spread over these processes |
 | `--out-root` | `/workspace/sim_results`; each site writes to `<out-root>/<site>/` |
 
 Example: `python ./src/mesh_simulation.py --intervals 15 5 --runs 50 --workers 16`.
@@ -94,10 +94,11 @@ rewritten after every simulation.
 | `sim_table.tex` | One LaTeX `tabular` (Site, Method, PDR, Collisions, Latency) per interval |
 | `sim_per_meter_runs.csv`, `sim_per_meter.csv` | Per-meter delivered readings, per run and pooled |
 | `sim_metadata.json` | Arguments, configuration and package versions |
-| `figures/` | `pdr_by_method.pdf` (all intervals), `pdr_latency_vs_interval.pdf`, `per_meter_pdr_<interval>min.pdf` (local coordinates) |
+| `figures/` | `pdr_by_method.pdf` (bars, all intervals), `pdr_vs_interval.pdf` and `latency_vs_interval.pdf` (lines, one-column width), `per_meter_pdr_<interval>min.pdf` (local coordinates) |
 
-In addition, `/workspace/sim_results/pdr_by_method_all_sites.pdf` shows the PDR bar charts of all
-sites in one two-column figure (one panel per site), updated after each site.
+In addition, `/workspace/sim_results/` holds two figures that combine all sites (one panel per site,
+two-column width), updated after each site: `pdr_by_method_all_sites.pdf` (bars) and
+`pdr_vs_interval_all_sites.pdf` (lines).
 
 ### Figures
 

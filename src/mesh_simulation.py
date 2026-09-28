@@ -17,10 +17,10 @@ Usage::
     python src/mesh_simulation.py --intervals 15 5 --runs 50 --workers 16
 
 Without arguments it simulates every ``<site>_plans.json`` in ``/workspace/sim_inputs`` for the
-reporting intervals 1, 5, 10 and 15 min, 100 Monte Carlo runs each. The outputs of a site go to
+reporting intervals 1, 2, 4, 8 and 15 min, 100 Monte Carlo runs each. The outputs of a site go to
 ``/workspace/sim_results/<site>/``; every file holds all intervals of that site (column
 ``interval_min``). The simulations (runs x methods) are spread
-over ``--workers`` processes (default: every CPU). Every simulation rebuilds its random draws from
+over ``--workers`` processes (default 32). Every simulation rebuilds its random draws from
 its own seeds, so the results do not depend on the number of workers.
 
 Before the simulations of each site the script runs seven deterministic validation tests, and before
@@ -43,7 +43,7 @@ from pathlib import Path
 
 # --- Input / output -------------------------------------------------------------
 PLANS_DIR = Path("/workspace/sim_inputs")     # default: every <site>_plans.json in this folder
-INTERVALS_MIN = [1, 5, 10, 15]                # default reporting intervals (min)
+INTERVALS_MIN = [1, 2, 4, 8, 15]              # default reporting intervals (min)
 OUTPUT_ROOT = Path("/workspace/sim_results")  # outputs: OUTPUT_ROOT/<site>/, all intervals together
 METHODS: list[str] = ["Joint", "Sequential", "All-relay"]  # order used in tables/plots
 # Earlier names of the methods in plan files; a plan file may use either name.
@@ -57,6 +57,7 @@ N_PERIODS = 20                       # measured reporting periods per run
 WARMUP_PERIODS = 1                   # simulated before the measured periods, excluded from statistics
 COOLDOWN_PERIODS = 1                 # simulated after them (keeps the load on), excluded from statistics
 N_RUNS = 100                         # default Monte Carlo runs (--runs); methods share random draws
+N_WORKERS = 32                       # default worker processes (--workers)
 BASE_SEED = 20260927
 
 # --- Radio and propagation (None = value from the plan file) ------------------------
@@ -249,7 +250,7 @@ def print_setup(intervals: list[int], n_runs: int, workers: int) -> None:
     for ttl in (1, 2, 3):
         print(f"  TTL {ttl}: unicast retransmissions timer {unicast_retrans_interval_ms(ttl):g} ms")
     print(f"Intervals {intervals} min, offset mode '{OFFSET_MODE}', {WARMUP_PERIODS} + {N_PERIODS} + "
-          f"{COOLDOWN_PERIODS} periods, {n_runs} runs, {workers} worker process(es)")
+          f"{COOLDOWN_PERIODS} periods, {n_runs} runs, {workers} worker process(es) on {os.cpu_count()} CPUs")
 
 
 # ## Part 1 — Model and assumptions
@@ -2094,26 +2095,58 @@ def plot_pdr_all_sites(summary: pd.DataFrame, path: Path) -> None:
     plt.close(fig)
 
 
-def plot_vs_interval(summary: pd.DataFrame, path: Path) -> None:
-    """PDR and mean latency against the reporting interval, one line per method (one-column width)."""
-    intervals = sorted(summary["interval_min"].unique())
-    fig, axes = plt.subplots(2, 1, figsize=(IEEE_SINGLE_COLUMN_IN, 3.9), sharex=True)
-    for m in METHODS:
-        g = summary[summary.method == m].sort_values("interval_min")
+def _lines_vs_interval(ax: plt.Axes, summary: pd.DataFrame, metric: str, intervals: list[float]) -> None:
+    """One line per method of ``metric`` ("pdr" in % or "latency_mean_ms") against the interval."""
+    for k, m in enumerate(METHODS):
+        g = summary[summary.method == m].set_index("interval_min").reindex(intervals)
+        # small horizontal offset per method (log axis) so the error bars do not hide each other
+        x = np.asarray(intervals, dtype=float) * 10 ** (0.018 * (k - (len(METHODS) - 1) / 2))
         kw = dict(color=METHOD_COLORS[m], marker=METHOD_MARKERS[m], ms=4, capsize=2, elinewidth=0.7, label=m)
-        pdr, ci = 100 * g["pdr"], 100 * g["pdr_ci95"]
-        axes[0].errorbar(g["interval_min"], pdr, yerr=[ci, np.minimum(ci, 100 - pdr)], **kw)
-        axes[1].errorbar(g["interval_min"], g["latency_mean_ms"], yerr=g["latency_mean_ms_ci95"], **kw)
-    for ax in axes:
-        ax.set_xscale("log")
-        ax.set_xticks(intervals, [f"{iv:g}" for iv in intervals])
-        ax.minorticks_off()
-        ax.grid(True, axis="both")
-    axes[0].set_ylabel("PDR (%)")
-    axes[1].set_ylabel("Mean latency (ms)")
-    axes[1].set_xlabel("Reporting interval (min)")
-    fig.legend(*axes[0].get_legend_handles_labels(), loc="outside upper center", ncol=len(METHODS),
+        if metric == "pdr":
+            y, ci = 100 * g["pdr"], 100 * g["pdr_ci95"].fillna(0)
+            ax.errorbar(x, y, yerr=[ci, np.minimum(ci, 100 - y)], **kw)
+        else:
+            ax.errorbar(x, g[metric], yerr=g[metric + "_ci95"].fillna(0), **kw)
+    ax.set_xscale("log")
+    ax.set_xticks(intervals, [f"{iv:g}" for iv in intervals])
+    ax.minorticks_off()
+    ax.grid(True, axis="both")
+    ax.set_ylabel("PDR (%)" if metric == "pdr" else "Mean latency (ms)")
+
+
+def plot_metric_vs_interval(summary: pd.DataFrame, metric: str, path: Path) -> None:
+    """One site: ``metric`` against the reporting interval, one line per method (one-column width)."""
+    intervals = sorted(summary["interval_min"].unique())
+    fig, ax = plt.subplots(figsize=(IEEE_SINGLE_COLUMN_IN, 2.5))
+    _lines_vs_interval(ax, summary, metric, intervals)
+    ax.set_xlabel("Reporting interval (min)")
+    fig.legend(*ax.get_legend_handles_labels(), loc="outside upper center", ncol=len(METHODS),
                frameon=False, handletextpad=0.3, columnspacing=0.8)
+    fig.savefig(path)
+    plt.close(fig)
+
+
+def plot_pdr_vs_interval_all_sites(summary: pd.DataFrame, path: Path) -> None:
+    """All sites in one two-column figure: PDR against the interval, one panel per site (shared axes)."""
+    sites = list(dict.fromkeys(summary["site"]))
+    intervals = sorted(summary["interval_min"].unique())
+    ncols = min(len(sites), 3)
+    nrows = math.ceil(len(sites) / ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(IEEE_DOUBLE_COLUMN_IN, 0.4 + 2.0 * nrows),
+                             sharex=True, sharey=True, squeeze=False)
+    for k, site in enumerate(sites):
+        ax = axes.flat[k]
+        _lines_vs_interval(ax, summary[summary.site == site], "pdr", intervals)
+        ax.set_title(f"({chr(97 + k)}) {site}", loc="left", pad=2)
+        if k % ncols:
+            ax.set_ylabel("")
+        if k // ncols == nrows - 1 or k + ncols >= len(sites):
+            ax.set_xlabel("Reporting interval (min)")
+            ax.tick_params(labelbottom=True)
+    for ax in axes.flat[len(sites):]:
+        ax.set_visible(False)
+    fig.legend(*axes.flat[0].get_legend_handles_labels(), loc="outside upper center", ncol=len(METHODS),
+               frameon=False)
     fig.savefig(path)
     plt.close(fig)
 
@@ -2215,7 +2248,8 @@ def write_results(su: "SiteUniverse", n_runs: int, runs: pd.DataFrame,
 
     plot_pdr_by_method(summary, out / "figures" / "pdr_by_method.pdf")
     if len(intervals) > 1:
-        plot_vs_interval(summary, out / "figures" / "pdr_latency_vs_interval.pdf")
+        plot_metric_vs_interval(summary, "pdr", out / "figures" / "pdr_vs_interval.pdf")
+        plot_metric_vs_interval(summary, "latency_mean_ms", out / "figures" / "latency_vs_interval.pdf")
     for iv in intervals:
         plot_per_meter_map(su.plans, per_meter[per_meter.interval_min == iv],
                            out / "figures" / f"per_meter_pdr_{iv:g}min.pdf")
@@ -2236,8 +2270,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                     help=f"reporting intervals in minutes (default {' '.join(map(str, INTERVALS_MIN))})")
     ap.add_argument("--runs", type=int, default=N_RUNS,
                     help=f"Monte Carlo runs per site and interval (default {N_RUNS})")
-    ap.add_argument("--workers", type=int, default=os.cpu_count() or 1,
-                    help="worker processes (default: every CPU)")
+    ap.add_argument("--workers", type=int, default=N_WORKERS,
+                    help=f"worker processes (default {N_WORKERS})")
     ap.add_argument("--out-root", type=Path, default=OUTPUT_ROOT,
                     help=f"outputs go to <out-root>/<site>/ (default {OUTPUT_ROOT})")
     args = ap.parse_args(argv)
@@ -2313,9 +2347,13 @@ def main(argv: list[str] | None = None) -> None:
                              initargs=([str(p.resolve()) for p in paths],)) as pool:
         for su in universes:
             summaries.append(run_site(pool, su, intervals, args))
-            combined = args.out_root / "pdr_by_method_all_sites.pdf"
-            plot_pdr_all_sites(pd.concat(summaries, ignore_index=True), combined)
-            print(f"Saved {combined} ({len(summaries)} site(s))")
+            all_sites = pd.concat(summaries, ignore_index=True)
+            plot_pdr_all_sites(all_sites, args.out_root / "pdr_by_method_all_sites.pdf")
+            saved = ["pdr_by_method_all_sites.pdf"]
+            if len(intervals) > 1:
+                plot_pdr_vs_interval_all_sites(all_sites, args.out_root / "pdr_vs_interval_all_sites.pdf")
+                saved.append("pdr_vs_interval_all_sites.pdf")
+            print(f"Saved {', '.join(saved)} in {args.out_root} ({len(summaries)} site(s))")
 
     print("\n=== All sites: PDR (%), mean latency (ms), collisions at relays and DCUs per reading "
           "(mean ± 95 % CI) ===")
