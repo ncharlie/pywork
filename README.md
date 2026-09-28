@@ -44,3 +44,16 @@ diff. Regenerate the notebook after editing it:
 pip install jupytext
 jupytext --to ipynb -o notebooks/dcu_relay_planning.ipynb src/dcu_relay_planning.py
 ```
+
+## Link metrics of the plans
+
+`notebooks/plan_link_metrics.ipynb` (source `src/plan_link_metrics.py`, regenerated with jupytext
+as above) reads one `<site>_plans.json` and compares the methods link by link:
+
+* link length split by role: **access** (meter -> its relay or the DCU) and **backbone** (relay -> next relay or the DCU);
+* link margin of every link (`P_rx - P_sens`, and the same minus the fade margin), and for each meter the weakest link on its path to the DCU;
+* for each relay, the meters really within `d_max` vs the children it has in the plan.
+
+Set `PLANS_JSON` (and optionally `METHODS`) in its configuration cell, or as environment variables
+`PLANS_JSON` / `LINK_RESULTS_DIR`. Figures (PDF + PNG) and CSVs go to
+`/workspace/plan_results/link_metrics/`.
