@@ -37,12 +37,12 @@
 # | Summary | Tables, CSV, LaTeX, and plan plots |
 # | 4 | JSON export for the simulation notebook |
 #
-# **Input.** For each site, upload a folder to the Colab runtime:
+# **Input.** For each site, put a folder on the RunPod pod:
 # ```
-# /content/sites/<site_name>/meters.csv       columns: DEVICE_NO, LATITUDE, LONGITUDE
-# /content/sites/<site_name>/candidates.csv   columns: POLE_NO, LATITUDE, LONGITUDE
+# /workspace/sites/<site_name>/meters.csv       columns: DEVICE_NO, LATITUDE, LONGITUDE
+# /workspace/sites/<site_name>/candidates.csv   columns: POLE_NO, LATITUDE, LONGITUDE
 # ```
-# Then choose *Runtime → Run all*. Outputs are written to `results/`.
+# Then run all cells. Outputs are written to `/workspace/plan_results/`.
 
 # %% [markdown]
 # ## Configuration
@@ -55,9 +55,9 @@ import os
 from pathlib import Path
 
 # --- Data ---------------------------------------------------------------------
-SITES_DIR = Path(os.environ.get("DCU_SITES_DIR", "/content/sites"))  # one sub-folder per site
+SITES_DIR = Path(os.environ.get("DCU_SITES_DIR", "/workspace/sites"))  # one sub-folder per site
 SITES: list[str] | None = None      # e.g. ["site_a", "site_b"]; None = every folder in SITES_DIR
-RESULTS_DIR = Path("results")
+RESULTS_DIR = Path(os.environ.get("DCU_RESULTS_DIR", "/workspace/plan_results"))  # all outputs
 DROP_DUPLICATE_IDS = True           # keep only the first row of a duplicated DEVICE_NO / POLE_NO
 GENERATE_DEMO_SITE = False          # True = write a synthetic "demo_site" into SITES_DIR (testing only)
 
@@ -76,15 +76,14 @@ TIME_LIMIT_S = 600.0                # per MILP solve (Gurobi TimeLimit)
 MIP_REL_GAP = 1e-6                  # relative MIP gap at which Gurobi stops (Gurobi MIPGap)
 TTL_MAX = 127                       # Bluetooth Mesh maximum TTL; caps the hop count H
 RANDOM_SEED = 20240501              # Gurobi Seed, numpy and random
-SOLVER_LOG = False                  # True = show the Gurobi solver log
+SOLVER_LOG = True                   # show the Gurobi log (every 60 s) for the real solves of Part 3
 REQUIRE_GUROBI_WLS = True           # stop if the academic WLS license credentials are not found
 GUROBI_THREADS = 32                 # Gurobi Threads parameter, set on the environment
 
 # --- Paper figures (IEEE) -----------------------------------------------------------
 FIG_WIDTH_IN = 7.16                 # IEEE two-column width (43 picas)
-FIG_ROW_HEIGHT_IN = 2.0             # height of one site row (two panels)
-ARIAL_FONT_PATH: str | None = None  # path to an arial.ttf file, if Arial is not installed
-SITE_LABELS: dict[str, str] = {}    # optional row labels, e.g. {"site_a": "Site A"}
+FIG_ROW_HEIGHT_IN = 2.0             # height of one row of the 2 x 2 site grid
+SITE_LABELS: dict[str, str] = {}    # optional panel labels, e.g. {"site_a": "Site 1"}
 
 # --- Verification -----------------------------------------------------------------
 BRUTE_FORCE_MAX_METERS = 12         # size of the instances checked by exhaustive search
@@ -92,27 +91,26 @@ BRUTE_FORCE_MAX_METERS = 12         # size of the instances checked by exhaustiv
 # %% [markdown]
 # ## Part 0 — Setup
 #
-# `gurobipy` (the Python interface of the Gurobi MILP solver) is not preinstalled on Colab; `pyproj`
-# usually is, but it is installed here to be safe. `numpy`, `pandas`, `scipy` and `matplotlib` come
-# with Colab and are not reinstalled, so the runtime does not need a restart.
+# The packages below are installed into the notebook's kernel: `gurobipy` (the Python interface of
+# the Gurobi MILP solver), `pyproj`, `matplotlib`, `numpy`, `pandas` and `scipy`. If the install
+# upgrades a package that was already imported, restart the kernel once and run all cells again.
 #
 # **Gurobi license (academic Web License Service).** Download `gurobi.lic` from the Gurobi
-# Web License Manager and add its three values as **Colab secrets** (key icon in the left
-# sidebar), with notebook access switched on:
+# Web License Manager and set its three values as **environment variables** of the RunPod pod
+# (pod template → Environment Variables), then start the pod:
 #
-# | Secret name | Value from `gurobi.lic` |
+# | Variable | Value from `gurobi.lic` |
 # |---|---|
 # | `WLSACCESSID` | `WLSACCESSID=...` |
 # | `WLSSECRET` | `WLSSECRET=...` |
 # | `LICENSEID` | `LICENSEID=...` |
 #
-# Outside Colab, environment variables with the same names are used instead. The credentials are
-# never written into the notebook. Without them, `gurobipy` only has its size-limited license
-# (2000 variables and constraints), which is too small for a real site; with
+# The credentials are never written into the notebook. Without them, `gurobipy` only has its
+# size-limited license (2000 variables and constraints), which is too small for a real site; with
 # `REQUIRE_GUROBI_WLS = True` the notebook stops here with a message instead.
 
 # %%
-# %pip install -q gurobipy pyproj
+# %pip install -q gurobipy pyproj matplotlib numpy pandas scipy
 
 # %%
 import collections
@@ -156,7 +154,7 @@ WLS_KEYS = ("WLSACCESSID", "WLSSECRET", "LICENSEID")
 
 
 def read_wls_credentials() -> dict[str, str] | None:
-    """Read the Gurobi WLS credentials from Colab secrets, else from environment variables.
+    """Read the Gurobi WLS credentials from environment variables.
 
     Returns:
         Dict with the three WLS keys, or None if none is set.
@@ -164,21 +162,7 @@ def read_wls_credentials() -> dict[str, str] | None:
     Raises:
         ValueError: If only some of the three keys are set.
     """
-    try:
-        from google.colab import userdata  # available on Colab only
-    except ImportError:
-        userdata = None
-    creds = {}
-    for key in WLS_KEYS:
-        value = None
-        if userdata is not None:
-            try:
-                value = userdata.get(key)
-            except Exception:  # secret missing or notebook access not granted
-                value = None
-        value = value or os.environ.get(key)
-        if value:
-            creds[key] = str(value).strip()
+    creds = {key: os.environ[key].strip() for key in WLS_KEYS if os.environ.get(key, "").strip()}
     if not creds:
         return None
     if len(creds) < len(WLS_KEYS):
@@ -195,9 +179,9 @@ def start_gurobi_env(require_wls: bool) -> tuple[gp.Env, str]:
     creds = read_wls_credentials()
     if creds is None and require_wls:
         raise RuntimeError(
-            "Gurobi WLS credentials not found. Add WLSACCESSID, WLSSECRET and LICENSEID as Colab "
-            "secrets (key icon in the left sidebar, notebook access on) or as environment variables, "
-            "or set REQUIRE_GUROBI_WLS = False to use a local gurobi.lic / the size-limited license.")
+            "Gurobi WLS credentials not found. Set WLSACCESSID, WLSSECRET and LICENSEID as environment "
+            "variables of the pod and restart the kernel, or set REQUIRE_GUROBI_WLS = False to use a "
+            "local gurobi.lic / the size-limited license.")
     env = gp.Env(empty=True)
     env.setParam("OutputFlag", 0)
     env.setParam("Threads", GUROBI_THREADS)
@@ -912,7 +896,9 @@ for site in sites.values():
 # checked against every row, bound and integrality requirement.
 #
 # Solver settings: `TimeLimit = TIME_LIMIT_S`, `MIPGap = MIP_REL_GAP`, `Seed = RANDOM_SEED`, and
-# `Threads = GUROBI_THREADS` on the environment; all other Gurobi parameters keep their defaults. Gurobi is deterministic for a fixed seed, thread
+# `Threads = GUROBI_THREADS` on the environment; all other Gurobi parameters keep their defaults.
+# The Gurobi log (`SOLVER_LOG`, one progress line every 60 s via `DisplayInterval`) is shown only
+# for the real solves of Part 3, not for the brute-force checks. Gurobi is deterministic for a fixed seed, thread
 # count and machine; a run stopped by the time limit can differ between machines.
 
 # %%
@@ -1204,7 +1190,7 @@ def tree_depths(parent: np.ndarray) -> np.ndarray:
 
 
 def solve_milp(unit: PlanningUnit, fixed_site: int | None = None, relay_weight: str = "neighbors", *,
-               mip_start: Plan | None = None,
+               mip_start: Plan | None = None, log: bool = False,
                time_limit_s: float = TIME_LIMIT_S, method: str | None = None) -> Plan:
     """Solve the MILP of 2.1 for one planning unit with Gurobi.
 
@@ -1215,6 +1201,8 @@ def solve_milp(unit: PlanningUnit, fixed_site: int | None = None, relay_weight: 
             Min-hop + min-relay).
         mip_start: Plan passed to Gurobi as MIP start; default: the all-relay plan at
             ``fixed_site`` (or at the minimum-hop pole if the site is free).
+        log: Show the Gurobi log (a progress line every 60 s). Off by default, so the brute-force
+            checks stay quiet; the real solves of Part 3 pass ``log=SOLVER_LOG``.
         time_limit_s: Gurobi time limit.
         method: Name stored in the plan (default 'Proposed' or 'Min-hop + min-relay' by weight).
 
@@ -1229,10 +1217,11 @@ def solve_milp(unit: PlanningUnit, fixed_site: int | None = None, relay_weight: 
     start_problems = check_point_feasible(model, start_vec)
 
     gm = gp.Model(f"{unit.site}_unit{unit.uid}", env=GUROBI_ENV)
-    gm.Params.OutputFlag = int(bool(SOLVER_LOG))
     gm.Params.TimeLimit = float(time_limit_s)
     gm.Params.MIPGap = float(MIP_REL_GAP)
     gm.Params.Seed = int(RANDOM_SEED)
+    gm.Params.DisplayInterval = 60
+    gm.Params.OutputFlag = int(bool(log))  # set last, so the settings above are not echoed
     cols = load_model(gm, model)
     if not start_problems:
         cols.Start = start_vec
@@ -1535,8 +1524,10 @@ for site in sites.values():
         t_unit = time.perf_counter()
         k_mh, _ = min_hop_site(unit)
         all_relay = all_relay_plan(unit, k_mh)
-        min_relay = solve_milp(unit, fixed_site=k_mh, relay_weight="unit", mip_start=all_relay)
-        proposed = solve_milp(unit, relay_weight="neighbors", mip_start=min_relay)
+        print(f"\n--- unit {unit.uid + 1}/{len(site.units)}: {MIN_RELAY} (N={unit.N}, C={unit.C}) ---")
+        min_relay = solve_milp(unit, fixed_site=k_mh, relay_weight="unit", mip_start=all_relay, log=SOLVER_LOG)
+        print(f"\n--- unit {unit.uid + 1}/{len(site.units)}: {PROPOSED} (N={unit.N}, C={unit.C}) ---")
+        proposed = solve_milp(unit, relay_weight="neighbors", mip_start=min_relay, log=SOLVER_LOG)
         plans = {PROPOSED: proposed, MIN_RELAY: min_relay, ALL_RELAY: all_relay}
         for m, plan in plans.items():
             results[site.name][m].append((plan, verify_plan(unit, plan)))
@@ -1666,65 +1657,33 @@ print(latex)
 # %% [markdown]
 # ### Paper figures (IEEE)
 #
-# Two PDF figures combine all sites, one row per site, with **Min-hop + min-relay** (left) next to
-# **Proposed** (right):
+# Two PDF figures combine all sites in a 2 x 2 grid of site blocks; each block shows the
+# **Sequential** plan (left; Min-hop + min-relay in the tables) next to the **Joint** plan
+# (right; Proposed in the tables):
 #
-# * `results/planning_plans.pdf`: meters, candidate poles, DCU, relays and parent links;
-# * `results/planning_coverage.pdf`: the same nodes without links, with a circle of radius
-#   $d_\text{max}$ around the DCU (yellow, transparent) and around every relay (pink, transparent).
+# ```
+# [Site 1 Sequential  Site 1 Joint]    [Site 2 Sequential  Site 2 Joint]
+# [Site 3 Sequential  Site 3 Joint]    [Site 4 Sequential  Site 4 Joint]
+# ```
 #
-# Each panel title gives the method, $R$ = redundant rebroadcasts $\sum_j |A(j)|\, r_j$, and the
-# mean / max tree hops; the legend title repeats these definitions. The figures follow IEEE
-# two-column width (`FIG_WIDTH_IN` = 7.16 in = 43 picas); all panels have the same size and a 1:1
-# scale in metres. Fonts are Arial, embedded in the PDF as TrueType (`pdf.fonttype = 42`): axis
-# labels 9 pt, tick values 8 pt, legend 8 pt, panel titles 8 pt. If Arial is not installed, the
-# notebook installs the Microsoft core fonts (Colab/Debian) or uses `ARIAL_FONT_PATH`; if that is
-# impossible it falls back to Liberation Sans (metrically identical to Arial) and prints a warning.
+# * `planning_plans.pdf`: meters, DCU, relays and parent links;
+# * `planning_coverage.pdf`: the same nodes without links, with a circle of radius $d_\text{max}$
+#   around the DCU (yellow, transparent) and around every relay (pink, transparent). Both figures
+#   use the same zoom (the planned meters plus 15 m), so circles are clipped at the panel edge.
+#
+# Panel titles give only the site and the method; the legend lists DCU, relay and non-relay meter.
+# The figures follow IEEE two-column width (`FIG_WIDTH_IN` = 7.16 in = 43 picas); all panels have
+# the same size and a 1:1 scale in metres. Fonts are Arial, embedded in the PDF as TrueType
+# (`pdf.fonttype = 42`): axis labels 9 pt, tick values 8 pt, legend 8 pt, panel titles 8 pt.
 
 # %%
-import glob
 import re
-import shutil
-import subprocess
 
-from matplotlib import font_manager
-from matplotlib.patches import Circle, Patch
+from matplotlib.patches import Circle
 
-
-def find_arial(extra_path: str | None) -> str | None:
-    """Register an Arial TrueType file with matplotlib and return its family name, or None."""
-    paths = ([extra_path] if extra_path else []) + sorted(
-        glob.glob("/usr/share/fonts/**/[Aa]rial.ttf", recursive=True))
-    for path in paths:
-        if Path(path).is_file():
-            font_manager.fontManager.addfont(path)
-            return font_manager.FontProperties(fname=path).get_name()
-    if any(f.name == "Arial" for f in font_manager.fontManager.ttflist):
-        return "Arial"
-    return None
-
-
-def setup_paper_font(extra_path: str | None) -> str:
-    """Make Arial available (installing it on Debian/Colab if needed); return the font family used."""
-    name = find_arial(extra_path)
-    if name is None and shutil.which("apt-get"):
-        print("Arial not found: installing ttf-mscorefonts-installer (Microsoft core fonts) ...")
-        subprocess.run("echo ttf-mscorefonts-installer msttcorefonts/accepted-mscorefonts-eula select true "
-                       "| debconf-set-selections && apt-get -qq update && "
-                       "apt-get -qq install -y ttf-mscorefonts-installer",
-                       shell=True, capture_output=True)
-        name = find_arial(extra_path)
-    if name is None:
-        name = "Liberation Sans" if any(f.name == "Liberation Sans" for f in font_manager.fontManager.ttflist) \
-            else "DejaVu Sans"
-        print(f"WARNING: Arial is NOT available; the figures use {name}. "
-              "Set ARIAL_FONT_PATH to an arial.ttf file to use Arial.")
-    return name
-
-
-PAPER_FONT = setup_paper_font(ARIAL_FONT_PATH)
+CHART_NAMES = {MIN_RELAY: "Sequential", PROPOSED: "Joint"}  # method names used in the charts
 PAPER_RC = {
-    "font.family": "sans-serif", "font.sans-serif": [PAPER_FONT], "font.size": 8,
+    "font.family": "sans-serif", "font.sans-serif": ["Arial"], "font.size": 8,
     "pdf.fonttype": 42, "ps.fonttype": 42,              # embed TrueType fonts (IEEE PDF eXpress)
     "axes.labelsize": 9, "xtick.labelsize": 8, "ytick.labelsize": 8,
     "legend.fontsize": 8, "legend.title_fontsize": 8, "axes.titlesize": 8,
@@ -1747,7 +1706,6 @@ def plan_extent(site: Site, methods: tuple[str, ...], margin_m: float) -> tuple[
 
 def draw_plan_panel(site: Site, method: str, ax: plt.Axes, style: str) -> None:
     """Draw one method's plan of one site; style 'links' (parent links) or 'coverage' (d_max circles)."""
-    ax.scatter(*site.pole_xy.T, marker="s", s=5, facecolors="none", edgecolors="0.65", linewidths=0.4, zorder=2)
     segs, dcus, relay_xy, other_xy = [], [], [], []
     for plan, _ in results[site.name][method]:
         unit = site.units[plan.uid]
@@ -1768,55 +1726,46 @@ def draw_plan_panel(site: Site, method: str, ax: plt.Axes, style: str) -> None:
     else:
         raise ValueError(f"unknown style '{style}'")
     if len(other_xy):
-        ax.scatter(*other_xy.T, s=3, c="0.35", linewidths=0, zorder=3)
+        ax.scatter(*other_xy.T, s=2.5, c="0.35", linewidths=0, zorder=3)
     if len(relay_xy):
-        ax.scatter(*relay_xy.T, s=9, c="tab:red", linewidths=0, zorder=4)
-    ax.scatter(*dcus.T, marker="*", s=70, c="gold", edgecolors="k", linewidths=0.5, zorder=5)
-    row = summary[(summary.site == site.name) & (summary.method == method)].iloc[0]
-    ax.set_title(f"{method}: R = {row['redundant rebroadcasts']}, "
-                 f"hops = {row['mean tree hops']:.2f} / {row['max tree hops']}", pad=3)
+        ax.scatter(*relay_xy.T, s=7, c="tab:red", linewidths=0, zorder=4)
+    ax.scatter(*dcus.T, marker="*", s=55, c="gold", edgecolors="k", linewidths=0.5, zorder=5)
+    ax.set_title(f"{SITE_LABELS.get(site.name, site.name)}: {CHART_NAMES[method]}", pad=3)
 
 
 def paper_figure(style: str, methods: tuple[str, str] = (MIN_RELAY, PROPOSED)) -> plt.Figure:
-    """All sites in one IEEE two-column figure: one row per site, one column per method."""
+    """All sites in one IEEE two-column figure: a 2 x 2 grid of site blocks, each block showing
+    the two methods side by side (Sequential left, Joint right)."""
     names = [n for n, s in sites.items() if s.units]
+    n_rows = math.ceil(len(names) / 2)
     with plt.rc_context(PAPER_RC):
-        fig, axes = plt.subplots(len(names), 2, figsize=(FIG_WIDTH_IN, len(names) * FIG_ROW_HEIGHT_IN + 0.55),
-                                 layout="constrained", squeeze=False)
+        fig = plt.figure(figsize=(FIG_WIDTH_IN, n_rows * FIG_ROW_HEIGHT_IN + 0.3), layout="constrained")
+        # Columns: [site A method 1, site A method 2, gap, site B method 1, site B method 2].
+        grid = fig.add_gridspec(n_rows, 5, width_ratios=[1, 1, 0.12, 1, 1])
         extents = {}
-        for r, name in enumerate(names):
+        for i, name in enumerate(names):
             site = sites[name]
-            lo, hi = plan_extent(site, methods, site.d_max if style == "coverage" else 15.0)
+            row, col0 = i // 2, 3 * (i % 2)
+            lo, hi = plan_extent(site, methods, 15.0)
             for c, m in enumerate(methods):
-                ax = axes[r, c]
+                ax = fig.add_subplot(grid[row, col0 + c])
                 extents[ax] = (lo, hi)
                 draw_plan_panel(site, m, ax, style)
                 ax.set_xlim(lo[0], hi[0])
                 ax.set_ylim(lo[1], hi[1])
-                ax.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(5))
+                ax.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(4))
                 ax.yaxis.set_major_locator(matplotlib.ticker.MaxNLocator(4))
                 if c == 0:
-                    ax.set_ylabel(f"{SITE_LABELS.get(name, name)}\ny (m)")
+                    ax.set_ylabel("y (m)")
                 else:
                     ax.tick_params(labelleft=False)
-                if r == len(names) - 1:
+                if i + 2 >= len(names):  # last block in its grid column
                     ax.set_xlabel("x (m)")
         handles = [Line2D([], [], marker="*", ls="", ms=8, mfc="gold", mec="k", mew=0.5, label="DCU"),
-                   Line2D([], [], marker="o", ls="", ms=3.5, mfc="tab:red", mec="none", label="relay"),
-                   Line2D([], [], marker="o", ls="", ms=2.2, mfc="0.35", mec="none", label="non-relay meter"),
-                   Line2D([], [], marker="s", ls="", ms=3, mfc="none", mec="0.65", mew=0.5, label="candidate pole")]
-        if style == "links":
-            handles.append(Line2D([], [], c="tab:blue", lw=0.8, label="parent link"))
-        else:
-            d = f"{sites[names[0]].d_max:.1f} m"
-            handles += [Patch(facecolor=DCU_FILL, edgecolor="none", label=f"DCU range ({d})"),
-                        Patch(facecolor=RELAY_FILL, edgecolor="none", label=f"relay range ({d})")]
-        n_uncovered = sum(len(sites[n].uncovered) for n in names)
-        title = "R: redundant rebroadcasts; hops: mean / max tree hops to the DCU"
-        if n_uncovered:
-            title += f"; {n_uncovered} uncovered meter{'s' if n_uncovered > 1 else ''} not shown"
-        fig.legend(handles=handles, loc="outside lower center", ncols=len(handles), title=title,
-                   frameon=False, handletextpad=0.3, columnspacing=1.2)
+                   Line2D([], [], marker="o", ls="", ms=3.2, mfc="tab:red", mec="none", label="relay"),
+                   Line2D([], [], marker="o", ls="", ms=2, mfc="0.35", mec="none", label="non-relay meter")]
+        fig.legend(handles=handles, loc="outside lower center", ncols=len(handles), frameon=False,
+                   handletextpad=0.3, columnspacing=1.5)
         # Freeze the constrained layout (all panels the same size), then widen each panel's limits
         # to the panel's width/height ratio so that 1 m in x equals 1 m in y.
         fig.canvas.draw()
@@ -1941,4 +1890,5 @@ for site in sites.values():
                 assert d == r["ttl"], f"{out}: TTL mismatch for {r['id']} ({m})"
     print(f"Wrote {out} ({out.stat().st_size / 1024:.1f} kB)")
 
+GUROBI_ENV.dispose()  # release the Gurobi license session
 print("\nDone.")
