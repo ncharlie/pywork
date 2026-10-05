@@ -35,6 +35,15 @@ To try the notebook without data, set `GENERATE_DEMO_SITE = True`.
 | `planning_coverage.pdf` | Same layout without links; transparent d_max circles around the DCU (yellow) and relays (pink), clipped at the panel edges |
 | `<site>_plans.json` | Parameters, local coordinates, planning units and each method's plan (DCU, relays, parents, TTL per meter), read by the simulation notebook |
 
+## JavaScript module (`js/solveLP.js`)
+
+`solveLP(meters, candidates, distances, options?)` solves the Joint (Proposed) MILP with
+highs.js. It imports `getHighs` from `./highs.js`, so place it next to that file. `distances` is
+the (meters + candidates) square matrix of Euclidean distances, with 0 meaning out of range; give
+co-located pairs a small positive value (e.g. `1e-6`), since 0 would read as out of range. It
+returns `{status, dcus, totalHops, totalDistance, nodes}`; see the JSDoc for details. Unlike the
+notebook, it passes no MIP start (`highs.solve` has no such input).
+
 ## Source
 
 `src/dcu_relay_planning.py` is the same notebook in jupytext percent format, which is easier to
